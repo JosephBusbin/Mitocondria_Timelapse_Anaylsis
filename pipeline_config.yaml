@@ -1,0 +1,115 @@
+pipeline_version: "2.2.0"
+
+paths:
+  raw_ometiff_root: "/sciclone/data10/bestmanlab/raw_ometiff"
+  scratch_work_root: "/sciclone/scr30/${USER}/mito_work"
+  models_dir: "/sciclone/data10/bestmanlab/models"
+  final_output_root: "/sciclone/data10/bestmanlab/outputs"
+  fiji_bin: "/opt/Fiji.app/ImageJ-linux64"
+  ilastik_bin: "/opt/ilastik/run_ilastik.sh"
+  mitolandscape_repo: "/opt/MitoLandscape" # Cloned from https://github.com/enricoenne/MitoLandscape
+
+metadata_defaults:
+  channel_mito: 1               # 1-indexed in ImageJ (mito-EGFP)
+  channel_cell: 2               # 1-indexed in ImageJ (tagRFP-T cytosol)
+  expected_xy_um: 0.16          # Fallback only if OME-XML PhysicalSizeX is missing
+  expected_z_um: 1.00           # Fallback only if OME-XML PhysicalSizeZ is missing
+  expected_dt_s: 11.7           # Fallback only if OME-XML TimeIncrement is missing
+
+stage3_preprocessing:
+  drift_correction:
+    enabled: true
+    engine: "Fast4DReg"         # Pylvänäinen et al. (2023) J. Cell Sci. (4x-70x faster than Correct 3D drift)
+    reference_channel: 2        # Estimate drift strictly on tagRFP-T cell arbor, then apply to Ch1 (mito-EGFP)
+    xy_projection_type: "Max_Intensity"
+    z_projection_type: "Max_Intensity"
+    time_averaging: 1           # Frames to average during cross-correlation
+    max_shift_xy_px: 25         # ~4.0 um max frame-to-frame shift in X,Y
+    max_shift_z_px: 5           # 5.0 um max frame-to-frame shift in Z
+    qc_max_total_drift_um: 15.0 # Flag warning in JSON if cumulative drift > 15 um
+
+  auto_crop_3d:
+    enabled: true
+    reference_channel: 2
+    padding_xy_um: 5.0          # Pad 5 um around 3D cell bounding box in X,Y
+    padding_z_um: 2.0           # Pad 2 slices above/below cell in Z
+
+  cytosolic_roi_gate:
+    enabled: true               # Isolates single-cell glial territory (Baldwin et al., 2025; Negri et al., 2025)
+    gaussian_sigma_xy_px: 2.0
+    gaussian_sigma_z_px: 1.0
+    threshold_method: "Triangle" # Triangle thresholding captures dim radial shafts
+    keep_largest_cc: true       # MorphoLibJ largest 3D connected component -> saved as *_cell_mask.tif
+    dilation_radius_um: 1.5     # Dilate by 1.5 um to gate Ch1 (mito-EGFP) extracellular noise
+
+  z_attenuation_correction:
+    enabled: true
+    trigger_drop_ratio: 0.30    # Apply Z-slice histogram matching if deep Z drops >30%
+
+  bleach_correction:
+    enabled: true
+    method: "Histogram Matching" # Miura (2020) F1000Research; applied across T
+
+  denoising:
+    median_xy_radius_px: 1.0    # Removes 1-px sCMOS/EMCCD shot-noise spikes (Chaudhry et al., 2020)
+    rolling_ball_radius_px: 15.0 # ~2.4 um radius; strips diffuse cytoplasmic GFP haze
+    sliding_paraboloid: true
+
+  intensity_normalization:
+    enabled: true
+    low_percentile: 1.0         # Mapped to 0 in uint16
+    high_percentile: 99.9       # Mapped to 50000 in uint16 (leaves headroom to 65535)
+    target_max_uint16: 50000
+    min_snr_gate: 2.5           # Flag low-SNR warning if (P_99.9 / P_50) < 2.5
+
+stage4_hybrid_segmentation:
+  stage4a_ilastik:
+    enabled: true
+    project_file: "bestman_mito_2d_v1.ilp"
+    export_source: "Probabilities"
+    foreground_class_index: 0   # Channel 0 of exported probabilities = Mitochondria
+    feature_mode: "2D_slices"   # Prevents 1.0 um Z-step blur across adjacent planes
+
+  stage4b_instance_segmentation:
+    engine: "cellpose"          # Options: "cellpose" (Cellpose 3, Stringer 2025) or "omnipose" (Cutler 2022)
+    model_type: "cyto3"         # Or path to fine-tuned "bestman_mito_tube.pth"
+    input_mode: "dual_channel"  # Stack [Ch1: mito_norm, Ch2: ilastik_prob]
+    diameter_px: 8.0            # ~1.28 um characteristic diameter for thin tubules
+    flow_threshold: 0.40        # Higher = more permissive instance splitting
+    cellprob_threshold: 0.0     # Logit threshold (0.0 corresponds to P = 0.50)
+    do_3d: false                # Disable isotropic 3D; use 2D + Z-stitching for 1.0 um Z
+    stitch_threshold: 0.35      # 2D-to-3D mask IoU stitching threshold across Z slices
+    anisotropy: 6.25            # PhysicalSizeZ / PhysicalSizeX = 1.0 / 0.16 = 6.25
+    min_volume_um3: 0.05        # Hardcoded physical volume floor from MitoLandscape / Mitochondria Analyzer (~2 voxels)
+
+stage5_tracking_and_mitolandscape:
+  trackmate_detector:
+    type: "LabelImageDetector"  # Reads integer instance masks from Stage 4B
+    simplify_contours: true
+
+  sparse_lap_tracker:
+    linking_max_distance_um: 2.5
+    linking_feature_penalties:
+      VOLUME: 1.0               # Penalize linking objects of drastically different volume
+    allow_gap_closing: true
+    gap_closing_max_distance_um: 3.0
+    max_frame_gap: 2
+    allow_track_splitting: true # Mitochondrial Fission
+    splitting_max_distance_um: 2.0
+    allow_track_merging: true   # Mitochondrial Fusion
+    merging_max_distance_um: 2.0
+    min_track_spots: 4          # Keep trajectories present in >= 4 timepoints
+
+  snt_autotrace:
+    enabled: true
+    tubeness_scales_um: [0.4, 0.8, 1.2, 1.6]
+    soma_detection: "EDT_Threshold"
+    max_mito_to_arbor_dist_um: 3.5 # Max radial distance to map a spot onto SNT path
+
+  mitolandscape_integration:
+    enabled: true               # Integrates Negri, Fernández, & Borrell (2025) Front. Cell Dev. Biol.
+    connectivity_3d: 26         # 26-voxel neighborhood for 3D mitochondrial graph skeletonization
+    minor_process_cutoff_um: 5.0 # Processes shorter than 5.0 um merged into soma compartment (id=1)
+    process_slice_thickness_um: 0.5 # Geodesic distance bin width along twisted radial process (default: 0.5 um)
+    apical_basal_orientation_axis: "Y" # Axis pointing toward ventricular surface for apical (id=2) vs basal (id=3)
+    motility_velocity_threshold_um_s: 0.02 # |v_axial| > 0.02 um/s classified as active anterograde/retrograde
