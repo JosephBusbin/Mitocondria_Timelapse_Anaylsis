@@ -132,15 +132,84 @@ def discover_fiji_java_home(explicit_fiji_dir: Optional[str] = None) -> Optional
         Path("/Applications/Fiji.app"),
     ])
 
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidate_roots.append(Path(local_app_data) / "mito_pipeline_tools" / "jre")
+
     is_win = sys.platform.startswith("win")
     java_exe_name = "java.exe" if is_win else "java"
 
     for root in candidate_roots:
-        java_dir = root / "java"
-        if java_dir.is_dir():
-            for java_bin in java_dir.rglob(java_exe_name):
-                if java_bin.is_file() and java_bin.parent.name == "bin":
-                    return str(java_bin.parent.parent)
+        if not root.is_dir():
+            continue
+        direct_bin = root / "bin" / java_exe_name
+        if direct_bin.is_file():
+            return str(root.resolve())
+        for java_bin in root.rglob(java_exe_name):
+            if java_bin.is_file() and java_bin.parent.name == "bin":
+                return str(java_bin.parent.parent.resolve())
+    return None
+
+
+def discover_slidebook_reader_jar(
+    explicit_bftools_dir: Optional[str] = None,
+    showinf_bin: Optional[str] = None,
+    explicit_fiji_dir: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Locates 3i's official SlideBook6Reader.jar plugin containing native libraries
+    (SBReadFile.dll on Windows, libSBReadFile.so on Linux) required to read modern
+    SlideBook 6 & 7 (.sld / .sldy) files without open-source Bio-Formats parser errors.
+    """
+    # 1. Respect explicit or already set BF_CP environment variable
+    if os.environ.get("BF_CP"):
+        for entry in os.environ["BF_CP"].split(os.pathsep):
+            p = Path(entry.strip('"'))
+            if p.is_file() and "SlideBook" in p.name:
+                return str(p.resolve())
+
+    candidate_dirs: List[Path] = []
+    if explicit_bftools_dir:
+        candidate_dirs.append(Path(explicit_bftools_dir))
+    if showinf_bin and Path(showinf_bin).exists():
+        candidate_dirs.append(Path(showinf_bin).resolve().parent)
+
+    # Windows local isolated environment: %LOCALAPPDATA%\mito_pipeline_tools\bftools
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidate_dirs.append(Path(local_app_data) / "mito_pipeline_tools" / "bftools")
+
+    # Current working directory and scripts directory
+    cwd = Path.cwd()
+    candidate_dirs.extend([
+        cwd,
+        cwd / "bftools",
+        Path(__file__).resolve().parent / "bftools",
+        Path(__file__).resolve().parent / "scripts",
+    ])
+
+    # Search common FIJI paths for SlideBook plugin
+    candidate_fiji: List[Path] = []
+    if explicit_fiji_dir:
+        candidate_fiji.append(Path(explicit_fiji_dir))
+    home = Path.home()
+    candidate_fiji.extend([
+        Path("C:/Fiji.app"),
+        home / "Fiji.app",
+        home / "Desktop" / "Fiji.app",
+        home / "Downloads" / "Fiji.app",
+        Path("/opt/Fiji.app"),
+        Path("/Applications/Fiji.app"),
+    ])
+    for froot in candidate_fiji:
+        candidate_dirs.append(froot / "jars" / "bio-formats")
+        candidate_dirs.append(froot / "plugins")
+
+    for cdir in candidate_dirs:
+        if cdir.is_dir():
+            for jar in cdir.glob("*SlideBook*.jar"):
+                if jar.is_file():
+                    return str(jar.resolve())
     return None
 
 
@@ -165,8 +234,10 @@ def parse_ome_xml_metadata(
     except ValueError:
         rel_parent = Path(cohort_year)
 
-    # Strip XML namespaces so ElementTree queries work cleanly across OME schema versions
-    xml_clean = re.sub(r'\sxmlns(:\w+)?="[^"]+"', "", xml_string)
+    # Strip opening OME namespace declarations and any prefixed attributes (e.g. xsi:schemaLocation)
+    # so standard ElementTree queries work reliably without unbound namespace errors across OME versions.
+    xml_clean = re.sub(r'<OME[^>]*>', '<OME>', xml_string, count=1)
+    xml_clean = re.sub(r'\s\w+:\w+="[^"]*"', '', xml_clean)
     root = ET.fromstring(xml_clean)
 
     images = root.findall(".//Image")
@@ -268,14 +339,34 @@ def inspect_sld_via_showinf(
     # -nopix: read header metadata only, skipping pixel blocks; -omexml-only: output structured XML
     cmd = [showinf_bin, "-nopix", "-omexml-only", str(sld_path)]
     proc = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env_vars, check=False
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env_vars, check=False
     )
-    if proc.returncode != 0 or "<OME" not in proc.stdout:
+    stdout_str = (proc.stdout or b"").decode("utf-8", errors="replace")
+    stderr_str = (proc.stderr or b"").decode("utf-8", errors="replace")
+    if proc.returncode != 0 or "<OME" not in stdout_str:
+        err_msg = stderr_str.strip() or stdout_str.strip()
+        if "ArrayIndexOutOfBoundsException" in err_msg or "SlidebookReader" in err_msg:
+            raise RuntimeError(
+                f"Bio-Formats legacy parser failed on {sld_path.name}. "
+                "This SlideBook 6+ file requires 3i's native reader plugin (SlideBook6Reader.jar). "
+                "Ensure SlideBook6Reader.jar is located in the bftools directory or set in BF_CP "
+                "(run scripts/setup_lab_windows.ps1 to install it automatically)."
+            )
+        if "Problem reading the Image Records" in err_msg or "The file is not a valid SlideBook document" in err_msg:
+            # Check for possible missing companion directory
+            stem = sld_path.stem
+            parent = sld_path.parent
+            expected_dirs = [parent / f"{stem}_data", parent / f"{stem}.sld_Files", parent / f"{stem}_Files"]
+            has_dir = any(d.is_dir() for d in expected_dirs)
+            dir_hint = " (companion data folder found)" if has_dir else " (likely aborted capture or companion folder missing)"
+            raise RuntimeError(
+                f"Corrupted Image Records / aborted acquisition{dir_hint}"
+            )
         raise RuntimeError(
-            f"showinf failed on {sld_path.name} (exit {proc.returncode}): {proc.stderr.strip()}"
+            f"showinf failed (exit {proc.returncode}): {err_msg[:200]}"
         )
-    xml_start = proc.stdout.find("<OME")
-    xml_str = proc.stdout[xml_start:]
+    xml_start = stdout_str.find("<OME")
+    xml_str = stdout_str[xml_start:]
     return parse_ome_xml_metadata(xml_str, sld_path, source_root, min_z, min_t, min_c)
 
 
@@ -333,12 +424,13 @@ def extract_4d_series_to_ometiff(
         str(out_path),
     ]
     proc = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env_vars, check=False
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env_vars, check=False
     )
+    stderr_str = (proc.stderr or b"").decode("utf-8", errors="replace")
     if proc.returncode != 0 or not out_path.exists():
         return (
             False,
-            f"Failed extracting series {meta.series_index} from {meta.sld_filename}: {proc.stderr.strip()}",
+            f"Failed extracting series {meta.series_index} from {meta.sld_filename}: {stderr_str.strip()}",
             0.0,
             None,
         )
@@ -396,8 +488,22 @@ def resolve_bftools_binaries(bftools_dir: Optional[str]) -> Tuple[str, str]:
     showinf_name = "showinf.bat" if is_win else "showinf"
     bfconvert_name = "bfconvert.bat" if is_win else "bfconvert"
 
+    candidate_dirs: List[Path] = []
     if bftools_dir:
-        bdir = Path(bftools_dir)
+        candidate_dirs.append(Path(bftools_dir))
+
+    # Auto-check user-space lab install directory on Windows
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidate_dirs.append(Path(local_app_data) / "mito_pipeline_tools" / "bftools")
+
+    # Auto-check relative bftools directories
+    candidate_dirs.extend([
+        Path.cwd() / "bftools",
+        Path(__file__).resolve().parent / "bftools",
+    ])
+
+    for bdir in candidate_dirs:
         s_bin = bdir / showinf_name
         b_bin = bdir / bfconvert_name
         if s_bin.exists() and b_bin.exists():
@@ -415,12 +521,12 @@ def get_tool_version(bin_path: str, env_vars: Dict[str, str]) -> str:
             [bin_path, "-version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             env=env_vars,
             timeout=10,
             check=False,
         )
-        for line in proc.stdout.splitlines():
+        stdout_str = (proc.stdout or b"").decode("utf-8", errors="replace")
+        for line in stdout_str.splitlines():
             if "Version" in line or "Bio-Formats" in line:
                 return line.strip()
     except Exception:
@@ -477,22 +583,78 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     showinf_bin, bfconvert_bin = resolve_bftools_binaries(args.bftools_dir)
 
-    # Configure subprocess environment (auto-detecting FIJI Java if needed)
+    # Configure subprocess environment (auto-detecting FIJI Java and SlideBook 6/7 native reader if needed)
     sub_env = os.environ.copy()
     java_home = discover_fiji_java_home(args.fiji_dir)
     if java_home:
         sub_env["JAVA_HOME"] = java_home
         sub_env["BF_JAVA_HOME"] = java_home
+        java_bin = str(Path(java_home) / "bin")
+        if java_bin not in sub_env.get("PATH", ""):
+            sub_env["PATH"] = f"{java_bin}{os.pathsep}{sub_env.get('PATH', '')}"
 
-    sld_files = sorted(
+    bftools_bin_dir = str(Path(showinf_bin).resolve().parent)
+    if bftools_bin_dir not in sub_env.get("PATH", ""):
+        sub_env["PATH"] = f"{bftools_bin_dir}{os.pathsep}{sub_env.get('PATH', '')}"
+
+    sb_jar = discover_slidebook_reader_jar(args.bftools_dir, showinf_bin, args.fiji_dir)
+    if sb_jar:
+        curr_cp = sub_env.get("BF_CP", "")
+        if sb_jar not in curr_cp:
+            sub_env["BF_CP"] = f"{sb_jar}{os.pathsep}{curr_cp}".rstrip(os.pathsep)
+        print(f"Using 3i SlideBook native reader JAR: {sb_jar}")
+
+    raw_candidates = sorted(
         [p for p in args.source_dir.rglob("*") if p.is_file() and p.suffix.lower() in {".sld", ".sldy"}]
     )
-    if not sld_files:
+    if not raw_candidates:
         print(f"[WARNING] No .sld or .sldy files found under {args.source_dir}")
         return 0
 
+    sld_files: List[Path] = []
+    unparseable_records: List[Dict[str, Any]] = []
+
+    for p in raw_candidates:
+        # Pre-filter: skip lock and temporary hidden files
+        if p.name.startswith(("~", ".~", "._", ".#", "temp")):
+            unparseable_records.append({
+                "sld_filename": p.name,
+                "status": "SKIPPED_TEMP_OR_LOCK",
+                "file_size_bytes": p.stat().st_size if p.exists() else 0,
+                "reason": "Temporary lock, backup, or hidden file prefix (~, .~, ._)",
+                "sld_path": str(p),
+            })
+            continue
+        try:
+            sz = p.stat().st_size
+        except OSError as e:
+            unparseable_records.append({
+                "sld_filename": p.name,
+                "status": "UNREADABLE_FILE",
+                "file_size_bytes": 0,
+                "reason": f"OS file access error: {e}",
+                "sld_path": str(p),
+            })
+            continue
+
+        # Pre-filter: 0-byte or incomplete stubs < 64 KB (valid SlideBook containers are multi-megabyte/gigabyte)
+        if sz < 64 * 1024:
+            unparseable_records.append({
+                "sld_filename": p.name,
+                "status": "SKIPPED_STUB",
+                "file_size_bytes": sz,
+                "reason": f"Incomplete or zero-byte stub ({sz} bytes < 64 KB threshold)",
+                "sld_path": str(p),
+            })
+            continue
+
+        sld_files.append(p)
+
+    if unparseable_records:
+        print(f"[INFO] Pre-filtered {len(unparseable_records)} non-data/stub file(s) (< 64 KB or temp locks).")
+
     total_raw_gb = sum(p.stat().st_size for p in sld_files) / (1024 ** 3)
-    print(f"Found {len(sld_files)} SlideBook file(s) ({total_raw_gb:.2f} GB total raw container size).")
+    print(f"Found {len(sld_files)} valid SlideBook container(s) ({total_raw_gb:.2f} GB total raw container size).")
     print(f"Filtering criteria: SizeZ >= {args.min_z}, SizeT >= {args.min_t}, SizeC >= {args.min_c}")
     if java_home:
         print(f"Using Java runtime: {java_home}")
@@ -525,7 +687,16 @@ def main() -> int:
                         qualifying_series.append(s)
                         qualifying_sld_paths.add(Path(s.sld_path))
             except Exception as exc:
-                print(f"[WARN] Could not parse {sld.name}: {exc}", file=sys.stderr)
+                file_sz = sld.stat().st_size if sld.exists() else 0
+                err_str = str(exc)
+                unparseable_records.append({
+                    "sld_filename": sld.name,
+                    "status": "UNPARSEABLE_CONTAINER",
+                    "file_size_bytes": file_sz,
+                    "reason": err_str,
+                    "sld_path": str(sld),
+                })
+                print(f"[WARN] Skipping unreadable {sld.name} ({file_sz / (1024**2):.1f} MB): {err_str}", file=sys.stderr)
 
     all_series.sort(key=lambda s: (s.sld_path, s.series_index))
     qualifying_series.sort(key=lambda s: (s.sld_path, s.series_index))
@@ -539,6 +710,16 @@ def main() -> int:
             writer.writeheader()
             for s in all_series:
                 writer.writerow(asdict(s))
+
+    # 1b. Write Unparseable / Skipped Files Audit Log (if any)
+    unparseable_csv = args.output_dir / "unparseable_sld_files.csv"
+    if unparseable_records:
+        fieldnames = ["sld_filename", "status", "file_size_bytes", "reason", "sld_path"]
+        with open(unparseable_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for rec in unparseable_records:
+                writer.writerow(rec)
 
     # 2. Write SLURM Job Array Manifests (movie_list.txt + per-year lists)
     hpc_root = args.hpc_raw_root.rstrip("/")
@@ -576,12 +757,14 @@ def main() -> int:
             "mode": args.mode,
         },
         "summary_metrics": {
+            "total_sld_candidates_found": len(raw_candidates),
             "total_sld_files_scanned": len(sld_files),
+            "total_unparseable_or_skipped": len(unparseable_records),
             "total_raw_sld_gb": round(total_raw_gb, 3),
             "total_series_inspected": len(all_series),
             "qualifying_4d_series_count": len(qualifying_series),
             "qualifying_sld_files_count": len(qualifying_sld_paths),
-            "Estimated_uncompressed_4d_gb": round(est_4d_uncompressed_gb, 3),
+            "estimated_uncompressed_4d_gb": round(est_4d_uncompressed_gb, 3),
             "cohorts_discovered": {yr: len(paths) for yr, paths in by_year.items()},
         },
     }
@@ -591,10 +774,14 @@ def main() -> int:
 
     print("\n--- Scan & Manifest Summary ---")
     print(f"Total .sld files scanned          : {len(sld_files)} ({total_raw_gb:.2f} GB)")
+    if unparseable_records:
+        print(f"Unparseable or skipped files      : {len(unparseable_records)} (audit logged to {unparseable_csv.name})")
     print(f"Total internal series inspected   : {len(all_series)}")
     print(f"Qualifying 4D time-lapse series   : {len(qualifying_series)} across {len(qualifying_sld_paths)} .sld file(s)")
     print(f"Estimated uncompressed 4D data    : {est_4d_uncompressed_gb:.2f} GB (~{est_4d_uncompressed_gb * 0.55:.2f} GB with lossless LZW)")
     print(f"Inventory CSV saved to            : {manifest_csv}")
+    if unparseable_records:
+        print(f"Unparseable audit CSV saved to    : {unparseable_csv}")
     print(f"SLURM array list saved to         : {master_list_path}")
     print(f"Checkpoint 2 provenance saved to  : {prov_json_path}")
 

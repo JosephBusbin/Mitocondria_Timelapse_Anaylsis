@@ -51,18 +51,27 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Tuple
 
-import numpy as np
-
 # Ensure pipeline modules in the same directory can be imported
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import collect_4d_sld_timelapses as sld_mod
-import preprocess_4d_stack as prep_mod
-import run_arbor_and_mitolandscape as ml_mod
-import run_hybrid_segmentation as seg_mod
-import run_trackmate_sparse_lap as track_mod
-from tiff_io import read_tiff, write_tiff
+
+try:
+    import numpy as np
+    import preprocess_4d_stack as prep_mod
+    import run_arbor_and_mitolandscape as ml_mod
+    import run_hybrid_segmentation as seg_mod
+    import run_trackmate_sparse_lap as track_mod
+    from tiff_io import read_tiff, write_tiff
+    HAVE_HPC_PACKAGES = True
+except ImportError:
+    HAVE_HPC_PACKAGES = False
+    np = None
+    prep_mod = None
+    ml_mod = None
+    seg_mod = None
+    track_mod = None
 
 
 class TestMito4DPipelineSuite(unittest.TestCase):
@@ -71,7 +80,10 @@ class TestMito4DPipelineSuite(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="mito4d_test_"))
         self.cfg_path = SCRIPT_DIR / "pipeline_config.yaml"
-        self.cfg = prep_mod.load_config(self.cfg_path)
+        if HAVE_HPC_PACKAGES and prep_mod:
+            self.cfg = prep_mod.load_config(self.cfg_path)
+        else:
+            self.cfg = {}
 
     def tearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
@@ -112,6 +124,172 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("Safety violation", proc.stderr)
 
+    def test_01b_criteria_thresholds(self):
+        """Verifies changing criteria for Z, T, and C filters accurately selects expected series."""
+        multi_xml = """<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+          <Image ID="Image:0" Name="3D_Stack_NoTime">
+            <Pixels SizeX="512" SizeY="512" SizeZ="30" SizeC="2" SizeT="1" Type="uint16"/>
+          </Image>
+          <Image ID="Image:1" Name="2D_Timelapse">
+            <Pixels SizeX="512" SizeY="512" SizeZ="1" SizeC="2" SizeT="50" Type="uint16"/>
+          </Image>
+          <Image ID="Image:2" Name="4D_SingleChannel">
+            <Pixels SizeX="512" SizeY="512" SizeZ="20" SizeC="1" SizeT="10" Type="uint16"/>
+          </Image>
+          <Image ID="Image:3" Name="4D_DualChannel_ShortTime">
+            <Pixels SizeX="512" SizeY="512" SizeZ="25" SizeC="2" SizeT="5" Type="uint16"/>
+          </Image>
+        </OME>"""
+        sld_file = Path("/data/2024/test.sld")
+
+        # Standard defaults: min_z=15, min_t=10, min_c=2 -> None qualify
+        res_default = sld_mod.parse_ome_xml_metadata(multi_xml, sld_file, Path("/data"), min_z=15, min_t=10, min_c=2)
+        self.assertEqual([s.is_4d_timelapse for s in res_default], [False, False, False, False])
+
+        # Single-channel allowed: min_c=1 -> Series 2 qualifies
+        res_c1 = sld_mod.parse_ome_xml_metadata(multi_xml, sld_file, Path("/data"), min_z=15, min_t=10, min_c=1)
+        self.assertEqual([s.is_4d_timelapse for s in res_c1], [False, False, True, False])
+
+        # Short timelapses allowed: min_t=5, min_c=2 -> Series 3 qualifies
+        res_t5 = sld_mod.parse_ome_xml_metadata(multi_xml, sld_file, Path("/data"), min_z=15, min_t=5, min_c=2)
+        self.assertEqual([s.is_4d_timelapse for s in res_t5], [False, False, False, True])
+
+        # Permissive: min_t=5, min_c=1 -> Series 2 and Series 3 both qualify
+        res_perm = sld_mod.parse_ome_xml_metadata(multi_xml, sld_file, Path("/data"), min_z=15, min_t=5, min_c=1)
+        self.assertEqual([s.is_4d_timelapse for s in res_perm], [False, False, True, True])
+
+    def test_01c_companion_dirs(self):
+        """Verifies detection of SlideBook companion data directories (_Files, _data, .dir)."""
+        sld_file = self.tmp_dir / "sample_acquisition.sld"
+        sld_file.touch()
+
+        # Initially no companion dirs
+        self.assertEqual(sld_mod.find_companion_sld_dirs(sld_file), [])
+
+        # Create companion candidate dirs
+        comp_data = self.tmp_dir / "sample_acquisition_data"
+        comp_files = self.tmp_dir / "sample_acquisition_Files"
+        comp_data.mkdir()
+        comp_files.mkdir()
+
+        found = sld_mod.find_companion_sld_dirs(sld_file)
+        self.assertEqual(len(found), 2)
+        self.assertIn(comp_data, found)
+        self.assertIn(comp_files, found)
+
+    def test_01d_sanitize_and_size_estimation(self):
+        """Verifies string sanitization and uncompressed 5D byte size calculation."""
+        self.assertEqual(
+            sld_mod.sanitize_filename("  4D Movie / #1 [Z-stack] (Test)  "),
+            "4D_Movie_1_Z-stack_Test",
+        )
+        # 512 x 512 x 20 Z x 2 C x 10 T x 16-bit (2 bytes) = 209,715,200 bytes = ~0.1953 GB
+        est = sld_mod.estimate_series_gb(x=512, y=512, z=20, c=2, t=10, bits=16)
+        self.assertAlmostEqual(est, 0.1953, places=3)
+
+    def _find_practice_file(self) -> Path:
+        candidates = [
+            SCRIPT_DIR.parent / "data" / "practice" / "05feb2025obf01avc01-B.sld",
+            SCRIPT_DIR / "data" / "practice" / "05feb2025obf01avc01-B.sld",
+        ]
+        for c in candidates:
+            if c.is_file():
+                return c
+        return candidates[0]
+
+    def test_01e_live_sld_inspection_if_available(self):
+        """If practice .sld file exists, verifies full scan and provenance generation without errors."""
+        practice_file = self._find_practice_file()
+        if not practice_file.is_file():
+            self.skipTest(f"Practice file not present at {practice_file}")
+
+        out_scan = self.tmp_dir / "scan_out"
+        cmd = [
+            sys.executable,
+            str(SCRIPT_DIR / "collect_4d_sld_timelapses.py"),
+            str(practice_file.parent),
+            str(out_scan),
+            "--mode", "scan-only",
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, f"Scan failed: {proc.stderr}")
+        self.assertTrue((out_scan / "sld_4d_inventory.csv").is_file())
+        self.assertTrue((out_scan / "movie_list.txt").is_file())
+        self.assertTrue((out_scan / "extraction_provenance.json").is_file())
+
+        # Verify exactly 49 series in inventory CSV
+        with open(out_scan / "sld_4d_inventory.csv", "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), 49)
+
+        # Verify Series 20 is flagged as qualifying 4D
+        s20 = next(r for r in rows if r["series_index"] == "20")
+        self.assertEqual(s20["is_4d_timelapse"], "True")
+        self.assertEqual(s20["size_z"], "49")
+        self.assertEqual(s20["size_t"], "10")
+        self.assertEqual(s20["size_c"], "2")
+
+    def test_01f_checksum_generation_and_verification(self):
+        """Verifies SHA-256 computation matches standard hashlib hash."""
+        test_file = self.tmp_dir / "checksum_test.bin"
+        test_data = b"Mitochondrial_4D_Timelapse_Integrity_Verification_Data_Block_2026"
+        with open(test_file, "wb") as f:
+            f.write(test_data)
+        import hashlib
+        expected_sha = hashlib.sha256(test_data).hexdigest()
+        actual_sha = sld_mod.compute_sha256(test_file)
+        self.assertEqual(actual_sha, expected_sha)
+
+    def test_01g_extract_ometiff_dry_run(self):
+        """Verifies --mode extract-ometiff --dry-run simulates extraction without creating large TIFFs."""
+        practice_file = self._find_practice_file()
+        if not practice_file.is_file():
+            self.skipTest(f"Practice file not present at {practice_file}")
+
+        out_dry = self.tmp_dir / "dry_out"
+        cmd = [
+            sys.executable,
+            str(SCRIPT_DIR / "collect_4d_sld_timelapses.py"),
+            str(practice_file.parent),
+            str(out_dry),
+            "--mode", "extract-ometiff",
+            "--dry-run",
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, f"Dry run failed: {proc.stderr}")
+        self.assertIn("[DRY-RUN] Would extract series", proc.stdout)
+        # Ensure no actual .ome.tif files were written
+        tif_files = list(out_dry.glob("*.ome.tif"))
+        self.assertEqual(len(tif_files), 0)
+
+    def test_01h_skip_existing_files(self):
+        """Verifies that extract-ometiff skips already extracted files unless --overwrite is passed."""
+        practice_file = self._find_practice_file()
+        if not practice_file.is_file():
+            self.skipTest(f"Practice file not present at {practice_file}")
+
+        out_skip = self.tmp_dir / "skip_out"
+        out_skip.mkdir()
+        # Pre-create the dummy target output file
+        dummy_out = out_skip / "05feb2025obf01avc01-B__S20_05feb2025avc01obf01-B_t2r_-_4.ome.tif"
+        with open(dummy_out, "wb") as f:
+            f.write(b"PRE_EXISTING_MOCK_DATA")
+
+        cmd = [
+            sys.executable,
+            str(SCRIPT_DIR / "collect_4d_sld_timelapses.py"),
+            str(practice_file.parent),
+            str(out_skip),
+            "--mode", "extract-ometiff",
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, f"Execution failed: {proc.stderr}")
+        self.assertIn("Skipped (already exists)", proc.stdout)
+        # Verify dummy file was NOT overwritten
+        with open(dummy_out, "rb") as f:
+            self.assertEqual(f.read(), b"PRE_EXISTING_MOCK_DATA")
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
     def test_02_tiff_io_5d_roundtrip(self):
         """Verifies lossless 5D (T, C, Z, Y, X) uint16 and float32 round-trip via tiff_io."""
         arr_u16 = np.random.randint(0, 50000, size=(3, 2, 6, 32, 32), dtype=np.uint16)
@@ -121,6 +299,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertEqual(loaded_u16.shape, arr_u16.shape)
         self.assertTrue(np.array_equal(arr_u16, loaded_u16))
 
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
     def test_03_fast4dreg_drift_sign_and_accuracy(self):
         """Verifies that Fast4DReg phase correlation estimates the exact corrective sign and aligns drifted objects."""
         # Create a 2-frame stack (T=2, Z=10, Y=64, X=64) with a bright soma at (z=4, y=25, x=25) at T=0
@@ -145,6 +324,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         com_t1 = ndimage_com(vol[1])
         self.assertLess(np.linalg.norm(np.array(com_t0) - np.array(com_t1)), 0.75)
 
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
     def test_04_fast_16bit_lut_histogram_matching(self):
         """Verifies that 16-bit LUT histogram matching restores bleached intensities accurately."""
         rng = np.random.default_rng(42)
@@ -156,6 +336,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         p99_restored = float(np.percentile(restored, 99.0))
         self.assertLess(abs(p99_restored - p99_ref) / p99_ref, 0.02)
 
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
     def test_05_vectorized_volume_filter_and_watershed_split(self):
         """Verifies O(N) LUT volume filtering and 3D watershed splitting of touching organelles."""
         # Create a 3D mask with two touching spheres along Y (centers at y=12 and y=20, radius=4)
@@ -179,6 +360,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(int(relabeled[0, 0, 0]), 0)  # Noise speck removed
 
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
     def test_06_sparse_lap_tracking_gap_fission_fusion(self):
         """Verifies gap closing, track splitting (fission), merging (fusion), and TrackMate v7 XML validity."""
         # Create a 5-frame label stack (T=5, Z=6, Y=64, X=64)
@@ -216,6 +398,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertIsNotNone(root.find(".//AllSpots"))
         self.assertIsNotNone(root.find(".//AllTracks"))
 
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
     def test_07_curved_arbor_internal_geodesic_and_swc(self):
         """Verifies that internal geodesic distance follows a curved U-shaped tube rather than Euclidean shortcuts."""
         # Build a U-shaped cell mask in (Z=3, Y=40, X=40) with dx=dy=0.5 um, dz=1.0 um
@@ -250,6 +433,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
             lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
         self.assertGreater(len(lines), 5)
 
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
     def test_08_end_to_end_pipeline_integration(self):
         """Executes Modules 1 through 4 end-to-end on a synthetic 4D dual-channel movie."""
         movie_id = "e2e_synthetic"
@@ -333,7 +517,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
             self.assertGreater(f_path.stat().st_size, 0, f"Empty output file: {f_path.name}")
 
 
-def ndimage_com(vol: np.ndarray) -> Tuple[float, float, float]:
+def ndimage_com(vol) -> Tuple[float, float, float]:
     """Helper to compute 3D center of mass of foreground intensity."""
     from scipy import ndimage as ndi
     return ndi.center_of_mass(vol)
