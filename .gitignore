@@ -1,3 +1,5 @@
 data/
 scripts/__pycache__
 scratch/
+# Timing trace written by 3i SlideBook native library (hard-coded name)
+*Java_SBReadFileJNI_openFile.txt

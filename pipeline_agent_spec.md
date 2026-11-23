@@ -15,14 +15,15 @@ All generated scripts must read their numerical parameters from a single YAML/JS
 ```yaml
 pipeline_version: "2.2.0"
 
+# Storage comes from MITO_* environment variables (defaults in scripts/mito_env.bash, all derived
+# from MITO_DATA_ROOT; default /sciclone/data10/$USER/mito_pipeline). Expanded by pipeline_config_io.py.
 paths:
-  raw_ometiff_root: "/sciclone/data10/bestmanlab/raw_ometiff"
-  scratch_work_root: "/sciclone/scr30/${USER}/mito_work"
-  models_dir: "/sciclone/data10/bestmanlab/models"
-  final_output_root: "/sciclone/data10/bestmanlab/outputs"
-  fiji_bin: "/opt/Fiji.app/ImageJ-linux64"
-  ilastik_bin: "/opt/ilastik/run_ilastik.sh"
-  mitolandscape_repo: "/opt/MitoLandscape" # Cloned from https://github.com/enricoenne/MitoLandscape
+  raw_ometiff_root: "${MITO_RAW_ROOT}"
+  scratch_work_root: "${MITO_SCRATCH_ROOT}"
+  models_dir: "${MITO_MODELS_DIR}"
+  final_output_root: "${MITO_OUTPUT_ROOT}"
+  ilastik_bin: "${MITO_ILASTIK_BIN}"    # ilastik 1.4.2, installed by scripts/setup_hpc_env.bash
+  mitolandscape_repo: "${MITO_TOOLS_DIR}/MitoLandscape" # Pinned clone of https://github.com/enricoenne/MitoLandscape
 
 metadata_defaults:
   channel_mito: 1               # 1-indexed in ImageJ (mito-EGFP)
@@ -167,8 +168,8 @@ stage5_tracking_and_mitolandscape:
   1. **Stage 4A (Headless ilastik)**:
      * Execute subprocess:
        ```bash
-       /opt/ilastik/run_ilastik.sh --headless \
-           --project="${MODELS_DIR}/bestman_mito_2d_v1.ilp" \
+       "${MITO_ILASTIK_BIN}" --headless \
+           --project="${MITO_MODELS_DIR}/bestman_mito_2d_v1.ilp" \
            --export_source="Probabilities" \
            --output_format=tif \
            --output_filename_format="${WORK_DIR}/{nickname}_Probabilities.tif" \

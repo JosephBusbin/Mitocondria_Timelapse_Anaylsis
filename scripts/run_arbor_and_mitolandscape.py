@@ -48,14 +48,15 @@ from scipy.sparse.csgraph import dijkstra, minimum_spanning_tree
 
 try:
     from tiff_io import read_tiff, write_tiff
+    from pipeline_config_io import load_config as _load_pipeline_config
 except ImportError:
     from .tiff_io import read_tiff, write_tiff
+    from .pipeline_config_io import load_config as _load_pipeline_config
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
-    """Loads and parses the master YAML configuration file."""
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(os.path.expandvars(f.read()))
+    """Loads pipeline_config.yaml, expanding ${MITO_*} storage placeholders (see pipeline_config_io)."""
+    return _load_pipeline_config(config_path)
 
 
 def compute_internal_geodesic_distance_3d(
@@ -72,6 +73,10 @@ def compute_internal_geodesic_distance_3d(
     dz, dy, dx = calib["dz_um"], calib["dy_um"], calib["dx_um"]
     if not np.any(cell_mask) or not np.any(soma_mask):
         return np.zeros_like(cell_mask, dtype=np.float32)
+    # Soma covers the entire cell (small or tightly cropped cell): every voxel is at distance 0,
+    # and fast marching would fail because the level set has no zero contour.
+    if not np.any(cell_mask.astype(bool) & ~soma_mask.astype(bool)):
+        return np.zeros_like(cell_mask, dtype=np.float32)
 
     try:
         import skfmm
@@ -82,6 +87,9 @@ def compute_internal_geodesic_distance_3d(
         return np.asarray(np.where(cell_mask > 0, dist_um, 0.0), dtype=np.float32)
     except ImportError:
         pass
+    except ValueError as exc:
+        # e.g. soma voxels only in components skfmm cannot reach; the graph solver below is exact.
+        print(f"[WARN] scikit-fmm failed ({exc}); using 26-connected Dijkstra geodesic solver.", file=sys.stderr)
 
     # Exact 6/26-connected internal graph Dijkstra solver over foreground voxels
     fg_coords = np.argwhere(cell_mask)  # Shape: (M, 3)
@@ -233,7 +241,7 @@ def build_arbor_swc_and_strahler_map(
     swc_out_path: Path,
     movie_id: str,
 ) -> np.ndarray:
-    """
+    r"""
     Constructs a 3D centerline tree from geodesic level-set centroids ($1.0\ \mu\text{m}$ shells),
     computes hierarchical Strahler branch orders, maps Strahler orders back onto the 3D volume,
     and writes a multi-node SWC reconstruction file (<movie_id>_arbor.swc) for FIJI SNT.
@@ -486,7 +494,7 @@ def main() -> int:
 
     cell_mask_raw, _ = read_tiff(cell_mask_path)
     cell_mask = cell_mask_raw > 0
-    labels_4d, _ = read_tiff(labels_path)
+    labels_4d, _ = read_tiff(labels_path, axes="TZYX")
     n_t = labels_4d.shape[0]
 
     m_cfg = cfg.get("stage5_tracking_and_mitolandscape", {}).get("mitolandscape_integration", {})

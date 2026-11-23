@@ -39,6 +39,7 @@ Because `preprocess_4d_stack.py` (Module 1) strips out extracellular autofluores
    * Inspect the **Axes** column in the Raw Data table.
    * For a 4D single-channel time-lapse $(T, Z, Y, X)$, ilastik must display **`tzyx`** (or **`zyx`** if you loaded a single 3D timepoint, with channel `c` implicit or `tzyxc`).
    * If ilastik misinterprets the axes (for example, showing `xyzc` instead of `tzyx`), right-click the row $\to$ **Edit properties...** and change **Axes** to **`tzyx`** (and set **Display Mode** to **Grayscale** so the Window Leveling contrast tool `t` is available).
+4. **Make the project self-contained (Storage = Copy into project file)**: right-click each row $\to$ **Edit properties...** $\to$ **Storage** $\to$ **Copy into project file**. By default the `.ilp` only stores a *link* to `C:\Users\<you>\...\*.tif`, a path SciClone cannot see. If the saved classifier is ever invalidated, headless ilastik has to retrain from your labels and needs that image. Copying it in makes the `.ilp` larger (roughly the size of the training TIFF), but it then works anywhere.
 
 ---
 
@@ -76,17 +77,47 @@ Because `preprocess_4d_stack.py` (Module 1) strips out extracellular autofluores
    * In the bottom-left **Group Visibility** panel, toggle the eye icon next to **Uncertainty** (cyan/magenta overlay) and **Segmentation** (`I` key toggles overlays on/off).
    * **Active Learning Loop**: Navigate through $Z$-slices and across your 3 training stacks. Wherever the **Uncertainty** layer glows brightly (indicating the Random Forest trees are split ~50/50), turn **Live Update OFF**, add a 1-pixel corrective stroke, and turn **Live Update ON**.
    * **Stop Early (Prevent Overfitting)**: Stop as soon as 15–30 total strokes across the 3 stacks produce clean, separated probability islands. Over-labeling hundreds of pixels slows down tree evaluation without improving accuracy.
+5. **Leave ambiguous regions unlabeled**: if you can't tell what a structure is (for example, a mitochondrion that runs into an amorphous bright mass), don't paint it as either class. Label only pixels you're confident about. Some uncertainty in those regions is expected and is better than training the classifier on guesses. Stage 4B (Cellpose) and the volume filter handle what remains.
 
 ---
 
-### Step 5: Configure `Prediction Export` Settings for Headless SciClone HPC Execution
-1. Click **4. Prediction Export** on the left panel.
-2. Ensure **Source** is set to **`Probabilities`** (the default).
-3. Click **Choose Export Image Settings...** (Manual p. 25, Fig. 2.16) and verify:
-   * **Convert to Data Type**: `floating 32-bit` (`float32`, range $0.0–1.0$) — *Do not renormalize to 8-bit integer, as Stage 4B expects floating-point probabilities.*
-   * **Transpose to Axis Order**: Keep default (`tzyxc` / `zyxc`).
-   * **Output File Info $\to$ Format**: Select **`tif`** (or `multipage tiff`).
-4. Click **OK**, then save the project (**`Project $\to$ Save Project`** as `bestman_mito_2d_v1.ilp`) and transfer it to `/sciclone/data10/${USER}/bestmanlab/models/bestman_mito_2d_v1.ilp`.
+### Step 5: Save the Trained Classifier (No GUI Export Needed)
+**You do NOT need to use the `Prediction Export` applet for the pipeline.** On SciClone, Stage 4A runs ilastik headless and picks the export format itself (see the note below). The `.ilp` only has to carry the trained classifier.
+
+1. With **Live Update ON**, wait until the prediction overlay has finished drawing for the current view. The Random Forest is then trained, and saving stores it in the project.
+2. **`Project $\to$ Save Project`** (`bestman_mito_2d_v1.ilp`).
+3. **`Project $\to$ Close Project`** (or quit ilastik) **before copying the file**. ilastik keeps the `.ilp` (an HDF5 file) open while the project is loaded, so close it first so the file on disk is complete.
+4. **Version match**: train in **ilastik 1.4.2**. That is the version `scripts/setup_hpc_env.bash` installs on SciClone, and projects saved by a different version may not load headless.
+
+> **Why the GUI export failed with `tif` / `multipage tiff`**: ilastik's `tif` export writes **2D only**, and `multipage tiff` writes **3D only**. The probabilities for a `tzyx` stack are 5D (`t, z, y, x, class`), so both fail with *"You are attempting to export a 4D result into a 2D file format"*. The pipeline runs headless with `--output_format=numpy --output_axis_order=tzyxc --export_dtype=float32` (see `scripts/run_hybrid_segmentation.py`), which handles any dimensionality. Whatever export settings are saved in the project are overridden there.
+>
+> *Optional QC only*: to inspect probabilities in Fiji, choose **Format = `hdf5`** in *Choose Export Image Settings...*, which handles any dimensionality, and open the result with Fiji's ilastik plugin. Alternatively, just look at the prediction layers inside the Training applet.
+
+---
+
+### Step 6: Transfer the `.ilp` to SciClone and Verify It Arrived Intact
+Destination: `${MITO_MODELS_DIR}/bestman_mito_2d_v1.ilp`. The default is `/sciclone/data10/<your_wm_username>/mito_pipeline/models/`; on SciClone, run `source scripts/mito_env.bash && echo $MITO_MODELS_DIR` to see the active path.
+
+1. **Record the size and checksum on Windows** (PowerShell):
+   ```powershell
+   $ilp = "$env:USERPROFILE\Downloads\bestman_mito_2d_v1.ilp"   # adjust to where you saved it
+   (Get-Item $ilp).Length
+   (Get-FileHash $ilp -Algorithm SHA256).Hash.ToLower()
+   ```
+   A trained project is never 0 bytes. If `Length` is `0` here, the project was never saved: reopen it in ilastik, then repeat Step 5.
+2. **Copy it** using either method:
+   * **PowerShell `scp`** (built into Windows 10/11; recommended because it reports errors). This is a single copy, so it's fine to run against the dev server:
+     ```powershell
+     scp $ilp <your_wm_username>@dev.sciclone.wm.edu:/sciclone/data10/<your_wm_username>/mito_pipeline/models/bestman_mito_2d_v1.ilp
+     ```
+   * **VS Code (Remote-SSH)**: in the Explorer, open the `models/` folder, right-click it, choose **Upload...**, and pick the file. Dragging from Windows Explorer can silently leave a 0-byte file if the transfer is interrupted or the source is still locked.
+3. **Verify on SciClone**. Both values must match Step 1:
+   ```bash
+   ls -l  /sciclone/data10/$USER/mito_pipeline/models/bestman_mito_2d_v1.ilp
+   sha256sum /sciclone/data10/$USER/mito_pipeline/models/bestman_mito_2d_v1.ilp
+   head -c 4 /sciclone/data10/$USER/mito_pipeline/models/bestman_mito_2d_v1.ilp | tail -c 3; echo   # prints HDF
+   ```
+   `run_pipeline_slurm.bash` and Stage 4A also refuse a missing, empty, or non-HDF5 `.ilp`, so a bad upload fails loudly instead of quietly switching to the fallback estimator.
 
 ---
 
@@ -98,7 +129,7 @@ Copy and fill out this block in your project's `README_provenance.md` whenever y
 ilastik_classifier_provenance:
   project_filename: "bestman_mito_2d_v1.ilp"
   date_trained: "YYYY-MM-DD"
-  ilastik_version: "1.4.x" # Must match HPC container/binary version
+  ilastik_version: "1.4.2" # Must match the HPC binary (setup_hpc_env.bash --ilastik-version)
   training_stacks_used:
     - movie_id: "<movie_1_mito_norm.tif>"
       frames_annotated: [0, 15]
@@ -120,8 +151,10 @@ ilastik_classifier_provenance:
   class_definitions:
     label_1_channel_0: "Mitochondria (1-px core spine strokes + dim tubule tips)"
     label_2_channel_1: "Background (1-px inter-mitochondrial clefts + halo edges + empty space)"
-  export_settings:
+  input_storage: "Copy into project file"
+  ilp_sha256: "<sha256sum on SciClone, must match Windows Get-FileHash>"
+  export_settings:  # set by run_hybrid_segmentation.py headless flags, not by the GUI
     source: "Probabilities"
     dtype: "float32"
-    format: "tif"
+    format: "numpy (.npy), axis order tzyxc"
 ```

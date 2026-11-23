@@ -48,14 +48,15 @@ from scipy.spatial.distance import cdist
 
 try:
     from tiff_io import read_tiff, write_tiff
+    from pipeline_config_io import load_config as _load_pipeline_config
 except ImportError:
     from .tiff_io import read_tiff, write_tiff
+    from .pipeline_config_io import load_config as _load_pipeline_config
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
-    """Loads and parses the master YAML configuration file."""
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(os.path.expandvars(f.read()))
+    """Loads pipeline_config.yaml, expanding ${MITO_*} storage placeholders (see pipeline_config_io)."""
+    return _load_pipeline_config(config_path)
 
 
 def extract_spots_fast_bounding_boxes(
@@ -212,8 +213,8 @@ def run_sparse_lap_tracking(
     Returns (num_tracks, num_spots, num_edges, num_fissions, num_fusions).
     """
     print(f"[{movie_id}] Loading 4D instance labels and normalized intensity stacks...")
-    labels_4d, _ = read_tiff(labels_path)
-    norm_4d, _ = read_tiff(norm_path)
+    labels_4d, _ = read_tiff(labels_path, axes="TZYX")
+    norm_4d, _ = read_tiff(norm_path, axes="TZYX")
     n_t, n_z, n_y, n_x = labels_4d.shape
     dt = calib["dt_s"]
 

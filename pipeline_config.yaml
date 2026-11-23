@@ -1,13 +1,15 @@
 pipeline_version: "2.2.0"
 
+# Storage is configured by environment variables, NOT edited here. Defaults live in
+# scripts/mito_env.bash (all derive from MITO_DATA_ROOT). To use shared lab storage:
+#   export MITO_DATA_ROOT=/sciclone/data10/<lab_group>/mito_pipeline
 paths:
-  raw_ometiff_root: "/sciclone/data10/bestmanlab/raw_ometiff"
-  scratch_work_root: "/sciclone/scr30/${USER}/mito_work"
-  models_dir: "/sciclone/data10/bestmanlab/models"
-  final_output_root: "/sciclone/data10/bestmanlab/outputs"
-  fiji_bin: "/opt/Fiji.app/ImageJ-linux64"
-  ilastik_bin: "/opt/ilastik/run_ilastik.sh"
-  mitolandscape_repo: "/opt/MitoLandscape" # Cloned from https://github.com/enricoenne/MitoLandscape
+  raw_ometiff_root: "${MITO_RAW_ROOT}"
+  scratch_work_root: "${MITO_SCRATCH_ROOT}"
+  models_dir: "${MITO_MODELS_DIR}"
+  final_output_root: "${MITO_OUTPUT_ROOT}"
+  ilastik_bin: "${MITO_ILASTIK_BIN}"    # ilastik 1.4.2 installed by scripts/setup_hpc_env.bash
+  mitolandscape_repo: "${MITO_TOOLS_DIR}/MitoLandscape" # Pinned clone of https://github.com/enricoenne/MitoLandscape (reference only; not imported)
 
 metadata_defaults:
   channel_mito: 1               # 1-indexed in ImageJ (mito-EGFP)

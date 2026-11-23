@@ -317,9 +317,10 @@ class TestMito4DPipelineSuite(unittest.TestCase):
             self.skipTest(f"Practice file not present at {practice_file}")
 
         out_skip = self.tmp_dir / "skip_out"
-        out_skip.mkdir()
+        # Top-level .sld files are staged under their cohort-year folder (2025/)
+        (out_skip / "2025").mkdir(parents=True)
         # Pre-create the dummy target output file
-        dummy_out = out_skip / "05feb2025obf01avc01-B__S20_05feb2025avc01obf01-B_t2r_-_4.ome.tif"
+        dummy_out = out_skip / "2025" / "05feb2025obf01avc01-B__S20_05feb2025avc01obf01-B_t2r_-_4.ome.tif"
         with open(dummy_out, "wb") as f:
             f.write(b"PRE_EXISTING_MOCK_DATA")
 
@@ -401,6 +402,16 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertIn("Problem reading the Image Records", rec.error_summary)
         self.assertIn("aborted acquisition", hint)
 
+    def test_01n_inventory_calibration_units(self):
+        """Verifies the inventory reports um and seconds even when OME stores nm and DeltaT in ms."""
+        series = sld_mod.parse_ome_xml_metadata(
+            BFCONVERT_STYLE_OME_XML, Path("/data/2025/movie.sld"), Path("/data"), min_z=1, min_t=1, min_c=1
+        )
+        self.assertEqual(len(series), 1)
+        self.assertAlmostEqual(series[0].phys_size_x_um, 0.16, places=4)    # 160 nm
+        self.assertAlmostEqual(series[0].time_interval_s, 11.7, places=3)   # DeltaT 11700 ms apart
+        self.assertTrue(series[0].calibration_complete)
+
     def test_01k_movie_list_entries_relative_or_absolute(self):
         """Verifies movie_list.txt entries are relative unless an HPC raw root is supplied."""
         rel = "2025/movie__S20_x.ome.tif"
@@ -409,6 +420,56 @@ class TestMito4DPipelineSuite(unittest.TestCase):
             sld_mod.manifest_entry("/sciclone/data10/lab/raw_ometiff", rel),
             "/sciclone/data10/lab/raw_ometiff/2025/movie__S20_x.ome.tif",
         )
+
+    @unittest.skipIf(sys.platform.startswith("win") or not shutil.which("bash"), "Requires bash")
+    def test_01l_storage_defaults_match_between_bash_and_python(self):
+        """Verifies scripts/mito_env.bash and pipeline_config_io.py agree on every MITO_* default."""
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith("MITO_")}
+        clean_env["USER"] = "testuser"
+        for root in (None, "/sciclone/data10/somelab/mito_pipeline"):
+            env = dict(clean_env)
+            if root:
+                env["MITO_DATA_ROOT"] = root
+            # 'env -0' prints NUL-separated KEY=VALUE pairs so values with newlines parse safely
+            proc = subprocess.run(
+                ["bash", "-c", f"source '{SCRIPT_DIR / 'mito_env.bash'}' && env -0"],
+                stdout=subprocess.PIPE, env=env, check=True,
+            )
+            bash_vals = dict(
+                item.split("=", 1) for item in proc.stdout.decode().split("\0")
+                if item.startswith("MITO_")
+            )
+            # Import lazily: pipeline_config_io needs pyyaml, which Stage 1 environments may lack.
+            if not _installed("yaml"):
+                self.skipTest("pyyaml not installed")
+            import pipeline_config_io as pcio
+            # resolve_mito_env reads the user name from os.environ, so pin it for the comparison.
+            saved_user = os.environ.get("USER")
+            os.environ["USER"] = "testuser"
+            try:
+                py_vals = pcio.resolve_mito_env({k: v for k, v in env.items() if k.startswith("MITO_")})
+            finally:
+                if saved_user is None:
+                    os.environ.pop("USER", None)
+                else:
+                    os.environ["USER"] = saved_user
+            self.assertEqual(bash_vals, py_vals)
+            if root:
+                self.assertEqual(py_vals["MITO_RAW_ROOT"], f"{root}/raw_ometiff")
+
+    @unittest.skipUnless(_installed("yaml"), "Requires pyyaml")
+    def test_01m_config_placeholders_expand_or_fail_loudly(self):
+        """Verifies ${MITO_*} placeholders expand from the environment and unknown ones raise."""
+        import pipeline_config_io as pcio
+        cfg = pcio.load_config(REPO_ROOT / "pipeline_config.yaml")
+        for key in ("raw_ometiff_root", "models_dir", "final_output_root", "ilastik_bin"):
+            self.assertNotIn("$", cfg["paths"][key])
+        bad_cfg = self.tmp_dir / "bad.yaml"
+        bad_cfg.write_text("paths:\n  x: \"${MITO_DOES_NOT_EXIST_123}/y\"  # ${COMMENTS_ARE_FINE}\n")
+        with self.assertRaises(ValueError) as ctx:
+            pcio.load_config(bad_cfg)
+        self.assertIn("MITO_DOES_NOT_EXIST_123", str(ctx.exception))
+        self.assertNotIn("COMMENTS_ARE_FINE", str(ctx.exception))
 
     @unittest.skipUnless(HAVE_TIFF_STACK, TIFF_SKIP_MSG)
     def test_02_tiff_io_5d_roundtrip(self):
@@ -543,6 +604,42 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         relabeled, count = seg_mod.filter_and_relabel_fast(split_masks, min_voxels=5)
         self.assertEqual(count, 2)
         self.assertEqual(int(relabeled[0, 0, 0]), 0)  # Noise speck removed
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_05b_ilastik_headless_export_contract(self):
+        """Stage 4A must request an N-D export (ilastik 'tif' is 2D-only) and reject empty .ilp uploads."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            empty_ilp = tmp / "empty.ilp"
+            empty_ilp.write_bytes(b"")
+            self.assertFalse(seg_mod.is_valid_ilastik_project(empty_ilp))
+            good_ilp = tmp / "good.ilp"
+            good_ilp.write_bytes(seg_mod.HDF5_SIGNATURE + b"\0" * 64)
+            self.assertTrue(seg_mod.is_valid_ilastik_project(good_ilp))
+
+            # Fake ilastik: writes a (T, Z, Y, X, 2) float32 .npy where it is told to, exactly as the
+            # real numpy exporter does, with class 0 = 0.75 everywhere.
+            fake_bin = tmp / "fake_ilastik.py"
+            fake_bin.write_text(
+                "#!" + sys.executable + "\n"
+                "import sys, numpy as np\n"
+                "a = dict(x.split('=', 1) for x in sys.argv[1:] if x.startswith('--') and '=' in x)\n"
+                "assert a['--output_format'] == 'numpy' and a['--output_axis_order'] == 'tzyxc'\n"
+                "p = np.zeros((2, 3, 4, 5, 2), np.float32); p[..., 0] = 0.75; p[..., 1] = 0.25\n"
+                "np.save(a['--output_filename_format'], p)\n",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+            raw_npy = tmp / "movie_ilastik_tzyxc.npy"
+            ok = seg_mod.run_stage4a_ilastik(tmp / "movie_mito_norm.tif", raw_npy, str(fake_bin), good_ilp, 1, 1000)
+            self.assertTrue(ok)
+            prob = seg_mod.load_ilastik_probabilities(raw_npy, 0, (2, 3, 4, 5))
+            self.assertEqual(prob.dtype, np.float32)
+            self.assertTrue(np.allclose(prob, 0.75))
+            with self.assertRaises(ValueError):  # shape mismatch vs mito_norm is an error, not silent
+                seg_mod.load_ilastik_probabilities(raw_npy, 0, (2, 3, 4, 6))
+            with self.assertRaises(ValueError):  # class index beyond exported channels
+                seg_mod.load_ilastik_probabilities(raw_npy, 2, (2, 3, 4, 5))
 
     @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_06_sparse_lap_tracking_gap_fission_fusion(self):

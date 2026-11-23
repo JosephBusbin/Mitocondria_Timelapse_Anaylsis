@@ -56,14 +56,15 @@ from scipy import ndimage
 
 try:
     from tiff_io import read_tiff, write_tiff
+    from pipeline_config_io import load_config as _load_pipeline_config
 except ImportError:
     from .tiff_io import read_tiff, write_tiff
+    from .pipeline_config_io import load_config as _load_pipeline_config
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
-    """Loads and parses the master YAML configuration file."""
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    """Loads pipeline_config.yaml, expanding ${MITO_*} storage placeholders (see pipeline_config_io)."""
+    return _load_pipeline_config(config_path)
 
 
 def parse_metadata(meta_dict: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, float]:
@@ -275,22 +276,29 @@ def preprocess_movie(
     movie_id = input_path.stem.replace(".ome", "")
 
     print(f"[{movie_id}] Reading 4D OME-TIFF: {input_path}")
-    raw_data, meta_tags = read_tiff(input_path)
+    # Normalize to (T, C, Z, Y, X) using the file's own axis labels (OME DimensionOrder / ImageJ axes)
+    # rather than guessing from array shape, which breaks for XYZTC exports or Z=2 stacks.
+    raw_data, meta_tags = read_tiff(input_path, axes="TCZYX")
     calib = parse_metadata(meta_tags, meta_defaults)
+    calib_warnings = list(meta_tags.get("_warnings", []))
+    for msg in calib_warnings:
+        print(f"[{movie_id}] [CALIBRATION WARNING] {msg}", file=sys.stderr)
 
-    # Standardize dimensions to (T, C, Z, Y, X)
-    if raw_data.ndim == 5:
-        if raw_data.shape[1] != 2 and raw_data.shape[2] == 2:
-            raw_data = np.transpose(raw_data, (0, 2, 1, 3, 4))
-    else:
-        raise ValueError(f"Expected 5D (T, C, Z, Y, X) hyperstack, got shape: {raw_data.shape}")
+    ch_mito_idx = int(meta_defaults.get("channel_mito", 1)) - 1
+    ch_cell_idx = int(meta_defaults.get("channel_cell", 2)) - 1
+    n_channels = raw_data.shape[1]
+    if max(ch_mito_idx, ch_cell_idx) >= n_channels:
+        raise ValueError(
+            f"{movie_id}: needs channels {ch_mito_idx + 1} (mito) and {ch_cell_idx + 1} (cell) "
+            f"but the file has C={n_channels} (shape TCZYX={raw_data.shape})."
+        )
 
     if dry_run:
         print(f"[DRY-RUN] Validated {movie_id} shape {raw_data.shape} and calibration {calib}")
         return {"movie_id": movie_id, "stage3_preprocessing_metrics": {"qc_status": "DRY_RUN"}}
 
-    ch_mito = raw_data[:, 0].astype(np.float32, copy=True)  # Shape: (T, Z, Y, X)
-    ch_cell = raw_data[:, 1].astype(np.float32, copy=True)  # Shape: (T, Z, Y, X)
+    ch_mito = raw_data[:, ch_mito_idx].astype(np.float32, copy=True)  # Shape: (T, Z, Y, X)
+    ch_cell = raw_data[:, ch_cell_idx].astype(np.float32, copy=True)  # Shape: (T, Z, Y, X)
     del raw_data  # Free raw buffer immediately to save RAM on compute node
     n_t, n_z, n_y, n_x = ch_mito.shape
 
@@ -440,6 +448,8 @@ def preprocess_movie(
         "movie_id": movie_id,
         "input_path": str(input_path),
         "calibration": calib,
+        # Non-empty means some calibration came from pipeline_config.yaml defaults, not the file.
+        "calibration_warnings": calib_warnings,
         "stage3_preprocessing_metrics": {
             "drift_engine": "Fast4DReg",
             "crop_origin_xyz_px": [int(x_min), int(y_min), int(z_min)],

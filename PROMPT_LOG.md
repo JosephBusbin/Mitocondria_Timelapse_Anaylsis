@@ -357,3 +357,113 @@ This file serves as persistent local memory for AI agents operating in this repo
   - Awaiting the user's OK to delete the two `_partial_update` files in the repo root (preserved in `1b9bcfd`).
   - Not committed yet.
   - Phase B per plan. Preprocess should switch to `read_tiff(axes="TCZYX")` and copy `meta["_warnings"]` into provenance. Test 08 will need ilastik + cellpose (B2).
+
+---
+
+## Session 2026-11-23 (cont.) — Phase A closed, Slurm-from-dev checked (Claude Opus 5.5)
+- **User Actions**:
+  - Deleted both `*_partial_update` files.
+  - Committed Phase A as `85db0f5` on `fix/reconcile-io-scripts`, which is also on origin.
+  - No lab PC access for now; the user will try `setup_lab_windows.ps1` on their own Windows device.
+- **Findings**:
+  - From dev, `module load slurm/bora` ("Slurm configured for bora/hima") makes sinfo/squeue/sbatch/srun/salloc work.
+  - Partitions: `batch` (45 nodes, 3-day limit) and `hima` (7 nodes).
+  - jbusbin's Slurm account on bora is `gzahn`.
+  - The module must be reloaded in every new shell.
+  - W&M doc: https://www.wm.edu/offices/it/services/researchcomputing/atwm/dev-server/
+- **Next**:
+  - Phase B (storage root variable, setup_hpc_env, Slurm script).
+  - Testing on compute nodes needs the user's explicit OK to submit short `srun`/`sbatch` jobs.
+
+---
+
+## Session 2026-11-23 (cont.) — Phase B executed + real-data pilot (Claude Opus 5.5)
+- **User Request**:
+  > Continue Phase B and run test jobs. Not on kuro / the Zahn lab's dedicated resources; normal bora batch jobs under the default account (`gzahn`) are fine.
+- **Key Decisions & Reasoning**:
+  - One settable root, `MITO_DATA_ROOT`, defined in `scripts/mito_env.bash` (bash) and `scripts/pipeline_config_io.py` (Python), with a parity test. Stage scripts share the Python loader.
+  - The uv venv replaces conda, so the interpreter is the module's exact Python 3.12.7 (same as the lab PC).
+  - Torch is the CPU wheel (bora has no GPUs). Cellpose is pinned `<4` because Cellpose 4 dropped `cyto3`. ilastik is 1.4.2 (latest Linux release; the `.ilp` must be trained in the same version).
+  - **Root cause of `MISSING_SB6_READER` on Linux**:
+    - `SlideBook6Reader.jar-20260903101721`'s `libSBReadFile.so` fails to `dlopen` (`undefined symbol _ZTI15CTileAnnotation`).
+    - Diagnosed with Nashorn `jjs` on Java 11 (the node has no jshell). Older builds were tested on bora: `20250730183505` and `20250707182452` read all 49 series.
+    - HPC pins `20250730183505`. Setup verifies the `.so` loads via `ctypes.CDLL` (shown to reject the broken build).
+  - Scripts submitted with srun must live on shared storage (`/sciclone/scr30/...`). The session scratchpad is dev-local `/tmp`.
+- **Jobs run (bora batch)**:
+  - 703189: setup (13 min).
+  - Test runs: 23 then 24/24 after fixes.
+  - Diagnostic srun jobs.
+  - Extraction job.
+  - 703358: `sbatch --stages 3` (83 s, MaxRSS 3.0 GB).
+  - Training-slice job.
+  - Logs: `/sciclone/scr30/jbusbin/mito_logs/`.
+  - Job scripts: `/sciclone/scr30/jbusbin/mito_jobs/`.
+- **Artifacts**:
+  - Tools: `/sciclone/data10/jbusbin/mito_pipeline/tools` (4.2 GB).
+  - Raw: `.../raw_ometiff/2025/`.
+  - Stage 3 work: `/sciclone/scr30/jbusbin/mito_work/2025/<movie>/`.
+  - Training stack: `.../ilastik_training/*_t0-4-9.tif`.
+- **Handoff / Next Steps**:
+  - The user reviews and commits Phase B (uncommitted on `fix/reconcile-io-scripts`).
+  - **Scientific review needed**: the real data has dx 0.1877 µm and dt 120 s, against the 0.16 µm / 11.7 s that the config's pixel-unit parameters and per-frame tracking distances assumed.
+  - The user trains `bestman_mito_2d_v1.ilp` in ilastik **1.4.2** on the t0-4-9 stack, copies it to `$MITO_MODELS_DIR`, then runs the full pipeline.
+  - The user runs `setup_lab_windows.ps1` on their own Windows PC (lab PC unavailable).
+  - Optional cleanup: `/local/jbusbin/venvs/tiffio_check`, `/local/jbusbin/bf73_check`, `/sciclone/scr30/jbusbin/mito_jobs/sb6_versions`.
+
+---
+
+## Session 2026-11-23 (cont.) — Windows check, calibration investigation (Claude Opus 5.5)
+- **User Request / Info**:
+  - The Windows suite on the user's own PC passed (22 run, 12 skipped).
+  - Activation failed without the leading dot. The user asked that the instructions not be user-specific.
+  - Approved deleting the 3i trace files.
+  - The user was concerned the real data didn't match the config. They believed 11.7 s was typical, and added two TIFFs to `bestman_lab_data/` for checking.
+  - The user also added `Plasmid_Primer_List_Bestman_Lab.csv`: **separate future task, untouched**.
+  - The user has ilastik 1.4.2 and will follow the protocol to train a test classifier.
+- **Findings / Decisions**:
+  - 120 s confirmed from per-plane DeltaT (ms) in the extracted OME. The two new TIFFs (ImageJ TYX max projections) are 0.1838 µm; one has finterval 11.71 s. Acquisition protocols differ, and the 0.16 µm default matches none of them.
+  - The collector inventory bug (units ignored, so dt was in ms) is fixed with the new `convert_ome_unit` and test 01n. Inventory regenerated on bora.
+  - Config defaults were left unchanged on purpose: it's a scientific decision for the user.
+- **Jobs**:
+  - `mito_calib` (header/timestamp check; script `/sciclone/scr30/jbusbin/mito_jobs/calib_check.py`).
+  - `mito_rescan` (scan-only).
+  - All earlier jobs are finished. The FAILED entries in sacct are superseded attempts.
+- **Handoff / Next Steps**:
+  - The user decides config defaults (`expected_xy_um`, `expected_dt_s`) and pixel/per-frame parameters for the 0.18–0.19 µm, 11.7 s vs 120 s regimes.
+  - The user trains the ilastik test classifier.
+  - Phase B remains uncommitted.
+  - Plasmid CSV task pending.
+
+---
+
+## Session 2026-11-23 (cont.) — ilastik export failure + 0-byte .ilp transfer (Claude Opus 5.5)
+- **User Request / Info**:
+  - Calibration: config changes are deferred until real data is examined. Keep assuming 11.7 s (from papers and data seen). Heterogeneous data may need splitting into groups; that filtering task is coming soon.
+  - ilastik first. Training "went alright", but the image is messy (a mitochondrion merges into an amorphous mass).
+  - The GUI Prediction Export to `tif` failed with "Image to export must have no more than 2 non-singleton dimensions … 4D result into a 2D file format", and `multipage tiff` also errored.
+  - Transferring the project produced a 0-byte file. The user asked for clearer instructions and a review of the ilastik guide.
+- **Findings**:
+  - ilastik 1.4.2 `lazyflow/.../opExportSlot.py` (on the cluster install): `tif` FormatInfo is 2–2 dims and `multipage tiff` is 3–3. Only hdf5/n5/zarr/numpy accept up to 5D.
+  - Our headless call used `--output_format=tif`, so Stage 4A would always have failed on real data and silently used the fallback.
+  - `OpTiffReader` reads our ImageJ hyperstacks as `tzyx`, which is correct.
+  - The venv has no h5py, so `numpy` export was chosen (np.load; no new dependency).
+  - ilastik replaces the output extension to match the format, so `.npy` targets are safe.
+  - `/sciclone/data10/jbusbin/mito_pipeline/models/bestman_mito_2d_v1.ilp` is 0 bytes (from the user's failed upload, 15:58). Left in place: the user's re-upload overwrites it, and it is now rejected by validation.
+- **Actions**:
+  - `scripts/run_hybrid_segmentation.py`:
+    - Added `HDF5_SIGNATURE`, `is_valid_ilastik_project`, `build_ilastik_command` (numpy / tzyxc / float32) and `load_ilastik_probabilities` (shape and class-index checks).
+    - Stage 4 errors if a valid `.ilp` fails, unless `MITO_ALLOW_ILASTIK_FALLBACK=1`.
+    - Added the provenance field `stage4a_probability_source`.
+  - `scripts/run_pipeline_slurm.bash`: the fail-fast checks `-s` and the `HDF` signature.
+  - `scripts/test_pipeline_suite.py`: new test_05b (fake ilastik binary).
+  - `manuals/ilastik_training_protocol.md`:
+    - Step 2.4: storage set to Copy into project file.
+    - Step 4.5: leave ambiguous regions unlabeled.
+    - Step 5 rewritten (save and close; no GUI export; QC via hdf5).
+    - New Step 6: transfer and verify with SHA256.
+  - Job `mito_ilptest` (srun, bora batch, 4 CPU / 8G): `/sciclone/scr30/jbusbin/mito_jobs/ilastik_contract_tests.sh`. Result: 26 tests OK (3 live-.sld tests skipped, no MITO_PRACTICE_SLD).
+- **Handoff / Next Steps**:
+  - The user re-saves the project (storage copied in, Live Update finished), closes it, and transfers with scp or VS Code Upload.
+  - Verify the sha256 and the `HDF` signature; then run `sbatch --stages 4` (or 3–5) on the pilot movie. That is the first real headless test of the numpy export flags.
+  - The calibration/grouping filter task is upcoming; the plasmid CSV task is still pending.
+  - Phase B onward is still uncommitted.

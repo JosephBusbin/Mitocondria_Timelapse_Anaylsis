@@ -17,9 +17,9 @@ This manual provides step-by-step instructions for extracting, validating, and s
 1. Press `Windows Key + R`, type `powershell`, and press `Enter`.
 2. Navigate to your project folder:
    ```powershell
-   cd C:\Users\josep\Code\School_Code\APSC424_code\Mitocondria_Timelapse_Anaylsis
+   cd "$env:USERPROFILE\path\to\Mitocondria_Timelapse_Anaylsis"
    ```
-   *(Adjust the path if your repository is located in a different directory).*
+   *(Replace `path\to` with wherever you cloned the repository, e.g. `Documents\GitHub`.)*
 
 ---
 
@@ -89,6 +89,9 @@ You should see:
 ```text
 [OK] Activated mito4d_env | Java: ... | bftools 8.5.0 | 3i SlideBook6Reader
 ```
+
+> [!IMPORTANT]
+> Keep the leading **dot and space** (`. `). Without them, PowerShell just prints the quoted path back to you and nothing is activated. `$env:LOCALAPPDATA` expands to your own `C:\Users\<you>\AppData\Local`, so the same line works for every user.
 
 > [!NOTE]
 > This activation sets `JAVA_HOME`, `BF_JAVA_HOME`, `BF_CP`, and updates `PATH` **only for the current PowerShell window**. It leaves all system-wide settings completely untouched.

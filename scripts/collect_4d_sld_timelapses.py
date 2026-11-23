@@ -44,6 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -104,8 +105,37 @@ class ShowinfError(RuntimeError):
         self.raw_stderr = raw_stderr
 
 
+# OME unit conversion to the pipeline's canonical um / s (mirrors tiff_io._LENGTH_TO_UM/_TIME_TO_S;
+# duplicated here because this script must stay standard-library only for the lab PC).
+LENGTH_TO_UM = {
+    "um": 1.0, "µm": 1.0, "μm": 1.0, "micron": 1.0, "microns": 1.0,
+    "nm": 1e-3, "Å": 1e-4, "A": 1e-4, "mm": 1e3, "cm": 1e4, "m": 1e6, "pm": 1e-6,
+}
+TIME_TO_S = {"s": 1.0, "sec": 1.0, "ms": 1e-3, "µs": 1e-6, "us": 1e-6, "min": 60.0, "h": 3600.0}
+
+
+def convert_ome_unit(value: Optional[str], unit: Optional[str], table: Dict[str, float]) -> Optional[float]:
+    """Converts an OME numeric attribute to um or s. Missing unit = OME default (um / s); unknown unit = None."""
+    if value is None:
+        return None
+    try:
+        val = float(value)
+    except ValueError:
+        return None
+    if not unit:
+        return val
+    factor = table.get(unit.strip())
+    return val * factor if factor is not None else None
+
+
 # Status values that mean showinf parsed the file successfully.
 HEALTHY_STATUSES = {"OK_4D", "OK_NON_4D"}
+
+# 3i's native SBReadFile library appends a timing trace to the hard-coded RELATIVE name
+# "C:\\Java_SBReadFileJNI_openFile.txt" (a literal filename on Linux, megabytes per run) in the
+# current directory. Bio-Formats subprocesses run from this throwaway directory so the trace
+# never lands in the repo or the user's data folders. Set by main(); None = inherit cwd.
+NATIVE_LOG_SINK_DIR: Optional[str] = None
 
 
 def sanitize_filename(name: str) -> str:
@@ -329,6 +359,10 @@ def parse_ome_xml_metadata(
         rel_parent = sld_path.parent.relative_to(source_root)
     except ValueError:
         rel_parent = Path(cohort_year)
+    if rel_parent == Path("."):
+        # Files at the top of source_root get a cohort-year folder so every staged movie has a
+        # cohort directory (the SLURM job names scratch/output folders after it).
+        rel_parent = Path(cohort_year)
 
     # Strip opening OME namespace declarations and any prefixed attributes (e.g. xsi:schemaLocation)
     # so standard ElementTree queries work reliably without unbound namespace errors across OME versions.
@@ -351,30 +385,29 @@ def parse_ome_xml_metadata(
         pixel_type = pixels.attrib.get("Type", "uint16")
         bits = int(pixels.attrib.get("SignificantBits", 16 if "16" in pixel_type else 8))
 
-        def _get_float(attr_name: str) -> Optional[float]:
-            val = pixels.attrib.get(attr_name)
-            try:
-                return round(float(val), 4) if val is not None else None
-            except ValueError:
-                return None
+        def _get_float(attr_name: str, table: Dict[str, float]) -> Optional[float]:
+            # Values are converted with their OME '<attr>Unit' (default um / s) so the inventory
+            # columns really are in um and seconds (SlideBook DeltaT is usually in ms).
+            val = convert_ome_unit(pixels.attrib.get(attr_name), pixels.attrib.get(f"{attr_name}Unit"), table)
+            return round(val, 4) if val is not None else None
 
-        phys_x = _get_float("PhysicalSizeX")
-        phys_y = _get_float("PhysicalSizeY")
-        phys_z = _get_float("PhysicalSizeZ")
-        time_inc = _get_float("TimeIncrement")
+        phys_x = _get_float("PhysicalSizeX", LENGTH_TO_UM)
+        phys_y = _get_float("PhysicalSizeY", LENGTH_TO_UM)
+        phys_z = _get_float("PhysicalSizeZ", LENGTH_TO_UM)
+        time_inc = _get_float("TimeIncrement", TIME_TO_S)
 
-        # Fallback: compute median delta_t from <Plane> elements if TimeIncrement attribute is omitted
+        # Fallback: compute mean delta_t from <Plane> elements if TimeIncrement attribute is omitted
         if time_inc is None and size_t > 1:
             planes = pixels.findall("Plane")
             t_deltas: Dict[int, float] = {}
             for p in planes:
                 t_idx = p.attrib.get("TheT")
-                delta_t = p.attrib.get("DeltaT")
+                delta_t = convert_ome_unit(p.attrib.get("DeltaT"), p.attrib.get("DeltaTUnit"), TIME_TO_S)
                 if t_idx is not None and delta_t is not None:
                     try:
                         t_i = int(t_idx)
                         if t_i not in t_deltas:
-                            t_deltas[t_i] = float(delta_t)
+                            t_deltas[t_i] = delta_t
                     except ValueError:
                         pass
             if len(t_deltas) >= 2:
@@ -435,7 +468,8 @@ def inspect_sld_via_showinf(
     # -nopix: read header metadata only, skipping pixel blocks; -omexml-only: output structured XML
     cmd = [showinf_bin, "-nopix", "-omexml-only", str(sld_path)]
     proc = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env_vars, check=False
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env_vars,
+        cwd=NATIVE_LOG_SINK_DIR, check=False,
     )
     # Decode bytes explicitly: Windows default text decoding crashes on the micro sign (0xb5 in 'µm').
     stdout_str = (proc.stdout or b"").decode("utf-8", errors="replace")
@@ -448,10 +482,10 @@ def inspect_sld_via_showinf(
             raise ShowinfError(f"Corrupted Image Records / aborted acquisition{dir_hint}", err_msg)
         if "ArrayIndexOutOfBoundsException" in err_msg or "SlidebookReader" in err_msg:
             raise ShowinfError(
-                f"Bio-Formats legacy parser failed on {sld_path.name}. "
-                "This SlideBook 6+ file requires 3i's native reader plugin (SlideBook6Reader.jar). "
-                "Place SlideBook6Reader.jar in <tools>/readers or set BF_CP "
-                "(scripts/setup_lab_windows.ps1 installs it automatically).",
+                f"Bio-Formats legacy parser failed on {sld_path.name}: 3i's SlideBook6Reader was not used. "
+                "Either SlideBook6Reader.jar is not on BF_CP (expected in <tools>/readers), or the jar's "
+                "native library failed to load on this OS (e.g. the 2026-09 Linux build is missing a "
+                "symbol; setup_hpc_env.bash pins a working build). Run showinf -debug to see which.",
                 err_msg,
             )
         raise ShowinfError(f"showinf failed (exit {proc.returncode}): {err_msg[:200]}", err_msg)
@@ -600,7 +634,8 @@ def extract_4d_series_to_ometiff(
         str(out_path),
     ]
     proc = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env_vars, check=False
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env_vars,
+        cwd=NATIVE_LOG_SINK_DIR, check=False,
     )
     stderr_str = (proc.stderr or b"").decode("utf-8", errors="replace")
     if proc.returncode != 0 or not out_path.exists():
@@ -627,6 +662,8 @@ def copy_qualifying_sld(
     try:
         rel_parent = sld_path.parent.relative_to(source_root)
     except ValueError:
+        rel_parent = Path(infer_cohort_year(sld_path))
+    if rel_parent == Path("."):
         rel_parent = Path(infer_cohort_year(sld_path))
 
     target_folder = output_dir / rel_parent
@@ -698,6 +735,7 @@ def get_tool_version(bin_path: str, env_vars: Dict[str, str]) -> str:
             stderr=subprocess.PIPE,
             env=env_vars,
             timeout=15,  # JVM cold start on a busy lab PC can exceed 10 s
+            cwd=NATIVE_LOG_SINK_DIR,
             check=False,
         )
         stdout_str = (proc.stdout or b"").decode("utf-8", errors="replace")
@@ -779,8 +817,19 @@ def main() -> int:
         print("[ERROR] Safety violation: output_dir must be distinct from read-only source_dir!", file=sys.stderr)
         return 1
 
+    # Absolute paths: Bio-Formats subprocesses run from a temp directory (see NATIVE_LOG_SINK_DIR).
+    args.source_dir = args.source_dir.resolve()
+    args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     showinf_bin, bfconvert_bin = resolve_bftools_binaries(args.bftools_dir)
+    showinf_bin = str(Path(showinf_bin).resolve()) if Path(showinf_bin).exists() else showinf_bin
+    bfconvert_bin = str(Path(bfconvert_bin).resolve()) if Path(bfconvert_bin).exists() else bfconvert_bin
+
+    # Throwaway working directory for Bio-Formats subprocesses (absorbs 3i's native trace file).
+    # TemporaryDirectory removes it when main() returns.
+    global NATIVE_LOG_SINK_DIR
+    native_log_sink = tempfile.TemporaryDirectory(prefix="mito_bf_cwd_")
+    NATIVE_LOG_SINK_DIR = native_log_sink.name
 
     # Configure subprocess environment (auto-detecting FIJI Java and SlideBook 6/7 native reader if needed)
     sub_env = os.environ.copy()

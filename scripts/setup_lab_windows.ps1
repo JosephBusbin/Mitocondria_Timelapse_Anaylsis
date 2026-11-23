@@ -319,6 +319,12 @@ Write-Host "  Java Home   : $JavaHome"
 Write-Host "  Bio-Formats : bftools $BfToolsVersion ($BfToolsDir)"
 Write-Host "  3i Reader   : $SbJar (reads SlideBook 6 .sld and 7 .sldy)"
 Write-Host "`nTo activate in PowerShell and run local extraction:"
-Write-Host "  . `"$ActivateScript`"" -ForegroundColor Yellow
+# Show the portable form for the default location so printed instructions match the manual for any user.
+$DefaultInstallDir = Join-Path $env:LOCALAPPDATA "mito_pipeline_tools"
+if ($InstallDir -eq $DefaultInstallDir) {
+    Write-Host "  . `"`$env:LOCALAPPDATA\mito_pipeline_tools\activate_mito4d.ps1`"   (keep the leading dot + space)" -ForegroundColor Yellow
+} else {
+    Write-Host "  . `"$ActivateScript`"   (keep the leading dot + space)" -ForegroundColor Yellow
+}
 Write-Host "  python scripts\collect_4d_sld_timelapses.py `"D:\RawSLD`" `"D:\Staged_OMETIFF`" --mode extract-ometiff --checksum" -ForegroundColor Yellow
 Write-Host "======================================================================" -ForegroundColor Green
