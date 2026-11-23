@@ -7,8 +7,12 @@ Tests Covered:
   1. test_01_sld_metadata_and_safety:
      - Verifies OME-XML parsing, 4D filtering (Z >= 15, T >= 10, C >= 2), cohort year inference,
        and strict read-only safety rejection when source_dir == output_dir.
-  2. test_02_tiff_io_5d_roundtrip:
-     - Verifies lossless 5D (T, C, Z, Y, X) uint16 and float32 round-trip read/write via tiff_io.py.
+  1i-1k. Health audit, error classification, and portable movie_list.txt entries
+     (sld_health_audit.csv statuses, raw-stderr classification via a fake showinf, relative paths).
+  2. test_02_tiff_io_5d_roundtrip (+ 02b-02e):
+     - Verifies lossless 5D (T, C, Z, Y, X) round-trips in both OME-TIFF and ImageJ formats,
+       calibration and unit conversion from bfconvert-style OME-XML (xsi:schemaLocation),
+       axis normalization (read_tiff(axes="TCZYX")), and int32 label masks.
   3. test_03_fast4dreg_drift_sign_and_accuracy:
      - Synthesizes a 3D cell volume shifted by (+5.0 px X, -3.0 px Y, +1.0 slice Z) and verifies
        that estimate_fast4dreg_drift returns corrective shifts (-5.0, +3.0, -1.0) and that
@@ -35,11 +39,20 @@ Tests Covered:
      - Runs Modules 1, 2, 3, and 4 sequentially on a synthetic 4D dual-channel movie and verifies
        all 13 output artifacts, CSV schemas, and JSON provenance records.
 
+Dependency Gating (no silent skips):
+  - Stage 1 tests (01*) need only the Python standard library.
+  - tiff_io tests (02*) run when numpy + tifffile are installed.
+  - Stage 3-5 tests (03-08) run when numpy, tifffile, scipy, pyyaml, and opencv are installed.
+  Gates check THIRD-PARTY packages only. When they are present, tiff_io.py and the stage scripts
+  are imported without try/except, so a missing or broken pipeline module is a loud error.
+
 Usage:
   python3 test_pipeline_suite.py -v
+  MITO_PRACTICE_SLD=/path/to/05feb2025obf01avc01-B.sld python3 test_pipeline_suite.py -v
 """
 
 import csv
+import importlib.util
 import json
 import os
 import shutil
@@ -53,25 +66,51 @@ from typing import Tuple
 
 # Ensure pipeline modules in the same directory can be imported
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import collect_4d_sld_timelapses as sld_mod
 
-try:
+
+def _installed(*modules: str) -> bool:
+    """True when every third-party module can be found (does not import it)."""
+    return all(importlib.util.find_spec(m) is not None for m in modules)
+
+
+HAVE_TIFF_STACK = _installed("numpy", "tifffile")
+HAVE_HPC_PACKAGES = HAVE_TIFF_STACK and _installed("scipy", "yaml", "cv2")
+
+np = None
+prep_mod = ml_mod = seg_mod = track_mod = tio = None
+if HAVE_TIFF_STACK:
     import numpy as np
+    import tiff_io as tio
+    from tiff_io import read_tiff, write_tiff
+if HAVE_HPC_PACKAGES:
     import preprocess_4d_stack as prep_mod
     import run_arbor_and_mitolandscape as ml_mod
     import run_hybrid_segmentation as seg_mod
     import run_trackmate_sparse_lap as track_mod
-    from tiff_io import read_tiff, write_tiff
-    HAVE_HPC_PACKAGES = True
-except ImportError:
-    HAVE_HPC_PACKAGES = False
-    np = None
-    prep_mod = None
-    ml_mod = None
-    seg_mod = None
-    track_mod = None
+
+TIFF_SKIP_MSG = "Requires numpy + tifffile"
+HPC_SKIP_MSG = "Requires HPC analysis packages (numpy, tifffile, scipy, pyyaml, opencv)"
+
+# A bfconvert-style OME-XML header: xsi:schemaLocation (unbound prefix once xmlns is removed),
+# mixed units (nm / um / ms), and no TimeIncrement so DeltaT fallback is exercised.
+BFCONVERT_STYLE_OME_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" '
+    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" UUID="urn:uuid:00000000-0000-0000-0000-000000000000" '
+    'xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 '
+    'http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">'
+    '<Image ID="Image:0" Name="t2r_-_4"><Pixels BigEndian="false" DimensionOrder="XYCZT" ID="Pixels:0" '
+    'PhysicalSizeX="160.0" PhysicalSizeXUnit="nm" PhysicalSizeY="0.16" PhysicalSizeYUnit="µm" '
+    'PhysicalSizeZ="1.0" PhysicalSizeZUnit="µm" SizeC="2" SizeT="3" SizeX="8" SizeY="8" SizeZ="2" Type="uint16">'
+    '<Plane TheC="0" TheT="0" TheZ="0" DeltaT="0" DeltaTUnit="ms"/>'
+    '<Plane TheC="0" TheT="1" TheZ="0" DeltaT="11700" DeltaTUnit="ms"/>'
+    '<Plane TheC="0" TheT="2" TheZ="0" DeltaT="23400" DeltaTUnit="ms"/>'
+    "</Pixels></Image></OME>"
+)
 
 
 class TestMito4DPipelineSuite(unittest.TestCase):
@@ -79,8 +118,9 @@ class TestMito4DPipelineSuite(unittest.TestCase):
 
     def setUp(self):
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="mito4d_test_"))
-        self.cfg_path = SCRIPT_DIR / "pipeline_config.yaml"
-        if HAVE_HPC_PACKAGES and prep_mod:
+        # pipeline_config.yaml lives in the repository root, not in scripts/
+        self.cfg_path = REPO_ROOT / "pipeline_config.yaml"
+        if HAVE_HPC_PACKAGES:
             self.cfg = prep_mod.load_config(self.cfg_path)
         else:
             self.cfg = {}
@@ -188,6 +228,9 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertAlmostEqual(est, 0.1953, places=3)
 
     def _find_practice_file(self) -> Path:
+        # MITO_PRACTICE_SLD lets HPC runs point at the copy on project storage.
+        if os.environ.get("MITO_PRACTICE_SLD"):
+            return Path(os.environ["MITO_PRACTICE_SLD"])
         candidates = [
             SCRIPT_DIR.parent / "data" / "practice" / "05feb2025obf01avc01-B.sld",
             SCRIPT_DIR / "data" / "practice" / "05feb2025obf01avc01-B.sld",
@@ -216,6 +259,11 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertTrue((out_scan / "sld_4d_inventory.csv").is_file())
         self.assertTrue((out_scan / "movie_list.txt").is_file())
         self.assertTrue((out_scan / "extraction_provenance.json").is_file())
+        with open(out_scan / "sld_health_audit.csv", "r", encoding="utf-8") as f:
+            health = list(csv.DictReader(f))
+        self.assertEqual(
+            [r["status"] for r in health if r["sld_filename"] == practice_file.name], ["OK_4D"]
+        )
 
         # Verify exactly 49 series in inventory CSV
         with open(out_scan / "sld_4d_inventory.csv", "r", encoding="utf-8") as f:
@@ -289,17 +337,153 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         with open(dummy_out, "rb") as f:
             self.assertEqual(f.read(), b"PRE_EXISTING_MOCK_DATA")
 
-    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
-    def test_02_tiff_io_5d_roundtrip(self):
-        """Verifies lossless 5D (T, C, Z, Y, X) uint16 and float32 round-trip via tiff_io."""
-        arr_u16 = np.random.randint(0, 50000, size=(3, 2, 6, 32, 32), dtype=np.uint16)
-        p_u16 = self.tmp_dir / "test_5d.ome.tif"
-        write_tiff(p_u16, arr_u16, metadata={"PhysicalSizeX": 0.16, "TimeIncrement": 11.7})
-        loaded_u16, meta = read_tiff(p_u16)
-        self.assertEqual(loaded_u16.shape, arr_u16.shape)
-        self.assertTrue(np.array_equal(arr_u16, loaded_u16))
+    def test_01i_health_audit_prefilter_statuses(self):
+        """Verifies every candidate gets one sld_health_audit.csv row (stub, lock, null header)."""
+        src = self.tmp_dir / "src" / "2024"
+        src.mkdir(parents=True)
+        (src / "tiny_stub.sld").write_bytes(b"\x01" * 100)          # < 64 KB -> SKIPPED_STUB
+        (src / "~lockfile.sld").write_bytes(b"\x01" * 70_000)       # lock prefix -> never opened
+        (src / "crashed_capture.sld").write_bytes(b"\x00" * 70_000)  # >= 64 KB but all zeros
+        out = self.tmp_dir / "audit_out"
 
-    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "collect_4d_sld_timelapses.py"),
+             str(self.tmp_dir / "src"), str(out), "--mode", "scan-only", "--hpc-raw-root", ""],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out / "sld_health_audit.csv", "r", encoding="utf-8") as f:
+            statuses = {r["sld_filename"]: r["status"] for r in csv.DictReader(f)}
+        self.assertEqual(statuses, {
+            "tiny_stub.sld": "SKIPPED_STUB",
+            "~lockfile.sld": "SKIPPED_TEMP_OR_LOCK",
+            "crashed_capture.sld": "EMPTY_OR_NULL_FILE",
+        })
+        self.assertFalse((out / "unparseable_sld_files.csv").exists())
+        with open(out / "extraction_provenance.json", "r", encoding="utf-8") as f:
+            prov = json.load(f)
+        self.assertEqual(prov["summary_metrics"]["total_unparseable_or_skipped"], 3)
+        self.assertEqual(prov["health_audit_by_year"]["2024"]["total"], 3)
+
+    def test_01j_error_classification_uses_raw_stderr(self):
+        """Verifies showinf failures are bucketed from the raw Java stderr, not the friendly hint."""
+        cases = {
+            "java.lang.AssertionError: The file is not a valid SlideBook document. Problem reading the Image Records":
+                "SLIDEBOOK_IMAGE_RECORDS_ERR",
+            "java.lang.ArrayIndexOutOfBoundsException: Index 0 out of bounds for length 0\n"
+            "  at loci.formats.in.SlidebookReader.initFile(SlidebookReader.java:412)":
+                "MISSING_SB6_READER",
+            "java.lang.UnsatisfiedLinkError: no SBReadFile in java.library.path": "JNI_OR_JAVA_ERR",
+            "SlideBook error: file already open": "SLIDEBOOK_SESSION_CONCURRENCY_ERR",
+            "something unexpected": "OTHER_ERR",
+        }
+        for stderr_text, expected in cases.items():
+            self.assertEqual(sld_mod.classify_showinf_error(stderr_text)[0], expected, stderr_text)
+
+        if sys.platform.startswith("win"):
+            self.skipTest("Fake showinf shell script requires a POSIX shell")
+        # End-to-end through audit_and_inspect_sld with a fake showinf that fails like 3i's native reader.
+        fake_showinf = self.tmp_dir / "showinf"
+        fake_showinf.write_text(
+            "#!/bin/sh\n"
+            "echo 'Exception in thread \"main\" java.lang.AssertionError: Failed with exception: "
+            "The file is not a valid SlideBook document. Problem reading the Image Records' >&2\n"
+            "exit 1\n"
+        )
+        fake_showinf.chmod(0o755)
+        sld = self.tmp_dir / "aborted.sld"
+        sld.write_bytes(b"\x01" * 70_000)
+        series, rec, hint = sld_mod.audit_and_inspect_sld(
+            sld, self.tmp_dir, str(fake_showinf), dict(os.environ), 15, 10, 2
+        )
+        self.assertEqual(series, [])
+        self.assertEqual(rec.status, "SLIDEBOOK_IMAGE_RECORDS_ERR")
+        self.assertIn("Problem reading the Image Records", rec.error_summary)
+        self.assertIn("aborted acquisition", hint)
+
+    def test_01k_movie_list_entries_relative_or_absolute(self):
+        """Verifies movie_list.txt entries are relative unless an HPC raw root is supplied."""
+        rel = "2025/movie__S20_x.ome.tif"
+        self.assertEqual(sld_mod.manifest_entry("", rel), rel)
+        self.assertEqual(
+            sld_mod.manifest_entry("/sciclone/data10/lab/raw_ometiff", rel),
+            "/sciclone/data10/lab/raw_ometiff/2025/movie__S20_x.ome.tif",
+        )
+
+    @unittest.skipUnless(HAVE_TIFF_STACK, TIFF_SKIP_MSG)
+    def test_02_tiff_io_5d_roundtrip(self):
+        """Verifies lossless 5D (T, C, Z, Y, X) round-trips in OME-TIFF and ImageJ formats with calibration."""
+        calib = {"dx_um": 0.16, "dy_um": 0.16, "dz_um": 1.0, "dt_s": 11.7}
+        # Z=3 is the RGB trap: without photometric='minisblack' tifffile stores it as RGB planes.
+        for dtype in (np.uint16, np.float32):
+            arr = (np.random.rand(3, 2, 3, 32, 32) * 50000).astype(dtype)
+            for name, expect_imagej in (("test_5d.ome.tif", False), ("test_5d.tif", True)):
+                path = self.tmp_dir / f"{dtype.__name__}_{name}"
+                write_tiff(path, arr, metadata=calib, axes="TCZYX")
+                loaded, meta = read_tiff(path, axes="TCZYX")
+                self.assertEqual(loaded.dtype, arr.dtype)
+                self.assertTrue(np.array_equal(arr, loaded), f"{path.name} not lossless")
+                self.assertAlmostEqual(float(meta["PhysicalSizeX"]), 0.16, places=5)
+                self.assertAlmostEqual(float(meta["PhysicalSizeZ"]), 1.0, places=5)
+                self.assertAlmostEqual(float(meta["TimeIncrement"]), 11.7, places=5)
+                self.assertNotIn("_warnings", meta)
+                import tifffile
+                with tifffile.TiffFile(path) as tif:
+                    self.assertEqual(tif.is_imagej, expect_imagej)
+                    self.assertEqual(bool(tif.ome_metadata), not expect_imagej)
+        self.assertEqual([p.name for p in self.tmp_dir.iterdir() if p.name.startswith(".")], [])
+
+    @unittest.skipUnless(HAVE_TIFF_STACK, TIFF_SKIP_MSG)
+    def test_02b_bfconvert_ome_xml_units_and_deltat(self):
+        """Verifies bfconvert-style OME-XML (xsi:schemaLocation, nm/ms units) parses to um and s."""
+        meta = tio._parse_ome_xml(BFCONVERT_STYLE_OME_XML)
+        self.assertNotIn("_warnings", meta)
+        self.assertAlmostEqual(meta["PhysicalSizeX"], 0.16, places=6)   # 160 nm -> 0.16 um
+        self.assertAlmostEqual(meta["PhysicalSizeY"], 0.16, places=6)
+        self.assertAlmostEqual(meta["PhysicalSizeZ"], 1.0, places=6)
+        self.assertAlmostEqual(meta["TimeIncrement"], 11.7, places=4)   # DeltaT in ms -> 11.7 s
+        self.assertNotIn("PhysicalSizeXUnit", meta)
+
+    @unittest.skipUnless(HAVE_TIFF_STACK, TIFF_SKIP_MSG)
+    def test_02c_axis_normalization(self):
+        """Verifies read_tiff(axes='TCZYX') reorders native layouts and inserts missing axes."""
+        base = np.arange(2 * 3 * 4 * 5 * 6, dtype=np.uint16).reshape(2, 3, 4, 5, 6)  # T C Z Y X
+        tzcyx = np.transpose(base, (0, 2, 1, 3, 4))
+        ctzyx = np.transpose(base, (1, 0, 2, 3, 4))
+        self.assertTrue(np.array_equal(tio.reorder_axes(tzcyx, "TZCYX", "TCZYX"), base))
+        self.assertTrue(np.array_equal(tio.reorder_axes(ctzyx, "CTZYX", "TCZYX"), base))
+
+        # 4D single-channel movie on disk -> 5D with C=1
+        single = base[:, 0]
+        path = self.tmp_dir / "single_channel.tif"
+        write_tiff(path, single, axes="TZYX")
+        loaded, meta = read_tiff(path, axes="TCZYX")
+        self.assertEqual(loaded.shape, (2, 1, 4, 5, 6))
+        self.assertEqual(meta["axes"], "TCZYX")
+        self.assertIn("PhysicalSizeX missing", " ".join(meta["_warnings"]))
+
+        with self.assertRaises(ValueError):
+            tio.reorder_axes(np.zeros((5, 4, 8, 8)), "IZYX", "TCZYX")
+
+    @unittest.skipUnless(HAVE_TIFF_STACK, TIFF_SKIP_MSG)
+    def test_02d_int32_label_mask_roundtrip(self):
+        """Verifies int32 label masks (not ImageJ-compatible) round-trip with axes and calibration."""
+        labels = np.random.randint(0, 70000, size=(3, 4, 16, 16), dtype=np.int32)
+        path = self.tmp_dir / "labels.tif"
+        write_tiff(path, labels, metadata={"dx_um": 0.16, "dz_um": 1.0, "dt_s": 11.7}, axes="TZYX")
+        loaded, meta = read_tiff(path)
+        self.assertEqual(loaded.dtype, np.int32)
+        self.assertTrue(np.array_equal(labels, loaded))
+        self.assertEqual(meta["axes"], "TZYX")
+        self.assertAlmostEqual(float(meta["PhysicalSizeX"]), 0.16, places=6)
+
+    @unittest.skipUnless(HAVE_TIFF_STACK, TIFF_SKIP_MSG)
+    def test_02e_unparseable_ome_is_reported_not_silent(self):
+        """Verifies a broken OME-XML block is reported in _warnings instead of silently returning {}."""
+        meta = tio._parse_ome_xml("<OME><Image><Pixels PhysicalSizeX='0.16'></Image></OME>")
+        self.assertIn("unparseable", " ".join(meta.get("_warnings", [])))
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_03_fast4dreg_drift_sign_and_accuracy(self):
         """Verifies that Fast4DReg phase correlation estimates the exact corrective sign and aligns drifted objects."""
         # Create a 2-frame stack (T=2, Z=10, Y=64, X=64) with a bright soma at (z=4, y=25, x=25) at T=0
@@ -324,7 +508,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         com_t1 = ndimage_com(vol[1])
         self.assertLess(np.linalg.norm(np.array(com_t0) - np.array(com_t1)), 0.75)
 
-    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_04_fast_16bit_lut_histogram_matching(self):
         """Verifies that 16-bit LUT histogram matching restores bleached intensities accurately."""
         rng = np.random.default_rng(42)
@@ -336,7 +520,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         p99_restored = float(np.percentile(restored, 99.0))
         self.assertLess(abs(p99_restored - p99_ref) / p99_ref, 0.02)
 
-    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_05_vectorized_volume_filter_and_watershed_split(self):
         """Verifies O(N) LUT volume filtering and 3D watershed splitting of touching organelles."""
         # Create a 3D mask with two touching spheres along Y (centers at y=12 and y=20, radius=4)
@@ -360,7 +544,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(int(relabeled[0, 0, 0]), 0)  # Noise speck removed
 
-    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_06_sparse_lap_tracking_gap_fission_fusion(self):
         """Verifies gap closing, track splitting (fission), merging (fusion), and TrackMate v7 XML validity."""
         # Create a 5-frame label stack (T=5, Z=6, Y=64, X=64)
@@ -398,7 +582,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertIsNotNone(root.find(".//AllSpots"))
         self.assertIsNotNone(root.find(".//AllTracks"))
 
-    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_07_curved_arbor_internal_geodesic_and_swc(self):
         """Verifies that internal geodesic distance follows a curved U-shaped tube rather than Euclidean shortcuts."""
         # Build a U-shaped cell mask in (Z=3, Y=40, X=40) with dx=dy=0.5 um, dz=1.0 um
@@ -433,7 +617,7 @@ class TestMito4DPipelineSuite(unittest.TestCase):
             lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
         self.assertGreater(len(lines), 5)
 
-    @unittest.skipUnless(HAVE_HPC_PACKAGES, "Requires HPC analysis packages (numpy, tifffile, scipy, etc.)")
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_08_end_to_end_pipeline_integration(self):
         """Executes Modules 1 through 4 end-to-end on a synthetic 4D dual-channel movie."""
         movie_id = "e2e_synthetic"

@@ -8,7 +8,9 @@
       2. Creates an isolated user-space directory structure.
       3. Detects Java from PATH/JAVA_HOME or an existing FIJI (Fiji.app) installation,
          falling back to a lightweight portable Eclipse Temurin JRE 17 (.zip) download.
-      4. Downloads and unpacks Bio-Formats CLI tools (bftools 7.3.0).
+      4. Downloads and unpacks Bio-Formats CLI tools (bftools 8.5.0 by default, -BfToolsVersion),
+         upgrading older installs (e.g. 7.3.0) in place, and installs 3i's SlideBook6Reader.jar
+         into a separate readers\ folder so bftools upgrades never delete it.
       5. Provisions a pinned Python 3.12.7 environment via portable uv (skipping heavy
          HPC-only Cellpose/PyTorch packages by default unless -IncludeHpcPackages is set).
       6. Generates activate_mito4d.ps1 and verifies both Python and Bio-Formats + Java.
@@ -24,6 +26,8 @@ param(
     [string]$FijiDir = "",
     [string]$EnvName = "mito4d_env",
     [string]$PythonVersion = "3.12.7",
+    [string]$BfToolsVersion = "8.5.0",
+    [string]$SbReaderUrl = "https://sites.imagej.net/SlideBook/jars/bio-formats/SlideBook6Reader.jar-20260903101721",
     [switch]$IncludeHpcPackages,
     [switch]$DryRun
 )
@@ -109,12 +113,17 @@ $TmpDir = Join-Path $CacheRoot "tmp"
 $UvDir = Join-Path $InstallDir "uv"
 $JreRoot = Join-Path $InstallDir "jre"
 $BfToolsDir = Join-Path $InstallDir "bftools"
+# The 3i reader lives outside bftools\ because a bftools version upgrade replaces that whole folder.
+$ReadersDir = Join-Path $InstallDir "readers"
+$SbJar = Join-Path $ReadersDir "SlideBook6Reader.jar"
+$LegacySbJar = Join-Path $BfToolsDir "SlideBook6Reader.jar"
 $ActivateScript = Join-Path $InstallDir "activate_mito4d.ps1"
 
 Write-Host "======================================================================" -ForegroundColor White
 Write-Host "Windows Lab PC Setup - Local .sld Extraction (4D Mitochondrial Pipeline)" -ForegroundColor White
 Write-Host "Install Dir         : $InstallDir"
 Write-Host "Python Environment  : $EnvPrefix (Python $PythonVersion)"
+Write-Host "Bio-Formats Version : $BfToolsVersion"
 Write-Host "HPC Analysis Pkgs   : $IncludeHpcPackages"
 Write-Host "Dry Run             : $DryRun"
 Write-Host "======================================================================" -ForegroundColor White
@@ -127,7 +136,8 @@ if ($DryRun) {
     } else {
         Write-Host "[DRY-RUN] No existing/FIJI Java found; would download portable Temurin JRE 17 (~42 MB) to: $JreRoot"
     }
-    Write-Host "[DRY-RUN] Would install Bio-Formats 7.3.0 CLI (showinf.bat / bfconvert.bat) and 3i SlideBook6Reader.jar to: $BfToolsDir"
+    Write-Host "[DRY-RUN] Would install/upgrade Bio-Formats $BfToolsVersion CLI (showinf.bat / bfconvert.bat) to: $BfToolsDir"
+    Write-Host "[DRY-RUN] Would install 3i SlideBook6Reader.jar to: $SbJar"
     Write-Host "[DRY-RUN] Would install portable uv and create Python $PythonVersion venv at: $EnvPrefix"
     Write-Host "[DRY-RUN] Would generate session activation script: $ActivateScript"
     exit 0
@@ -157,7 +167,7 @@ $env:PIP_CACHE_DIR = Join-Path $CacheRoot "pip"
 # Step 3: Locate Java (System or FIJI) or download lightweight portable JRE 17.
 # ------------------------------------------------------------------------------
 Write-Step -Number 3 -Total $TotalSteps -Title "Locate Existing Java (FIJI/System) or Download Portable JRE 17" `
-    -Reason "Bio-Formats requires a Java runtime to read and convert .sld files locally, so we reuse FIJI's bundled Java if present or fetch a minimal ~42 MB portable JRE."
+    -Reason "Bio-Formats $BfToolsVersion requires Java 8+ to read and convert .sld files locally, so we reuse FIJI's bundled Java if present or fetch a minimal ~42 MB portable JRE."
 $JavaHome = Find-JavaHome -ExplicitFijiDir $FijiDir -LocalJreRoot $JreRoot
 if ($JavaHome) {
     Write-Host "      Reusing existing Java runtime at: $JavaHome" -ForegroundColor Green
@@ -181,26 +191,44 @@ $env:BF_JAVA_HOME = $JavaHome
 $env:PATH = "$(Join-Path $JavaHome 'bin');$env:PATH"
 
 # ------------------------------------------------------------------------------
-# Step 4: Download Bio-Formats CLI tools (bftools 7.3.0).
+# Step 4: Install or upgrade Bio-Formats CLI tools and the 3i SlideBook 6 reader.
 # ------------------------------------------------------------------------------
-Write-Step -Number 4 -Total $TotalSteps -Title "Install Bio-Formats CLI Tools (bftools 7.3.0) & 3i SlideBook 6/7 Reader" `
-    -Reason "showinf.bat and bfconvert.bat perform read-only OME-XML inspection and lossless .ome.tif extraction; SlideBook6Reader.jar provides 3i's native parser (SBReadFile.dll) for modern .sld/.sldy containers."
+Write-Step -Number 4 -Total $TotalSteps -Title "Install/Upgrade Bio-Formats CLI Tools (bftools $BfToolsVersion) & 3i SlideBook 6 Reader" `
+    -Reason "showinf.bat/bfconvert.bat do read-only OME-XML inspection and lossless .ome.tif extraction; SlideBook6Reader.jar is still required because Bio-Formats' built-in reader crashes on SlideBook 6 .sld block tables."
 $ShowInfBat = Join-Path $BfToolsDir "showinf.bat"
 $BfConvertBat = Join-Path $BfToolsDir "bfconvert.bat"
-if (-not ((Test-Path $ShowInfBat) -and (Test-Path $BfConvertBat))) {
-    $BfZip = Join-Path $TmpDir "bftools.zip"
-    Invoke-WebRequest -Uri "https://downloads.openmicroscopy.org/bio-formats/7.3.0/artifacts/bftools.zip" -OutFile $BfZip -UseBasicParsing
-    Expand-Archive -Path $BfZip -DestinationPath $InstallDir -Force
-    Remove-Item $BfZip -Force
-} else {
-    Write-Host "      bftools 7.3.0 already present at: $BfToolsDir"
+if (-not (Test-Path $ReadersDir)) {
+    New-Item -ItemType Directory -Path $ReadersDir -Force | Out-Null
 }
 
-$SbJar = Join-Path $BfToolsDir "SlideBook6Reader.jar"
+# Preserve a jar from the older layout (bftools\SlideBook6Reader.jar) before any upgrade replaces bftools\.
+if ((Test-Path $LegacySbJar) -and -not (Test-Path $SbJar)) {
+    Move-Item -Path $LegacySbJar -Destination $SbJar
+    Write-Host "      Moved existing SlideBook6Reader.jar from bftools\ to: $ReadersDir"
+}
+
+$NeedsBfInstall = $true
+if ((Test-Path $ShowInfBat) -and (Test-Path $BfConvertBat)) {
+    $CurrentBfVer = (& $ShowInfBat -version 2>&1 | Out-String)
+    if ($CurrentBfVer -match [regex]::Escape($BfToolsVersion)) {
+        $NeedsBfInstall = $false
+        Write-Host "      bftools $BfToolsVersion already present at: $BfToolsDir"
+    } else {
+        Write-Host "      Found a different bftools version; upgrading in place to $BfToolsVersion..." -ForegroundColor Yellow
+    }
+}
+if ($NeedsBfInstall) {
+    # Download first, then replace: a failed download never leaves the PC without working bftools.
+    $BfZip = Join-Path $TmpDir "bftools_$BfToolsVersion.zip"
+    Invoke-WebRequest -Uri "https://downloads.openmicroscopy.org/bio-formats/$BfToolsVersion/artifacts/bftools.zip" -OutFile $BfZip -UseBasicParsing
+    if (Test-Path $BfToolsDir) { Remove-Item $BfToolsDir -Recurse -Force }
+    Expand-Archive -Path $BfZip -DestinationPath $InstallDir -Force
+    Remove-Item $BfZip -Force
+}
+
 if (-not (Test-Path $SbJar)) {
-    Write-Host "      Downloading 3i SlideBook 6/7 native reader JAR..."
-    $SbUrl = "https://sites.imagej.net/SlideBook/jars/bio-formats/SlideBook6Reader.jar-20260903101721"
-    Invoke-WebRequest -Uri $SbUrl -OutFile $SbJar -UseBasicParsing
+    Write-Host "      Downloading 3i SlideBook 6 native reader JAR..."
+    Invoke-WebRequest -Uri $SbReaderUrl -OutFile $SbJar -UseBasicParsing
 } else {
     Write-Host "      3i SlideBook6Reader.jar already present at: $SbJar"
 }
@@ -264,9 +292,9 @@ if (Test-Path "$EnvPrefix\Scripts\Activate.ps1") {
 `$env:VIRTUAL_ENV = "$EnvPrefix"
 `$env:JAVA_HOME = "$JavaHome"
 `$env:BF_JAVA_HOME = "$JavaHome"
-`$env:BF_CP = "$BfToolsDir\SlideBook6Reader.jar"
+`$env:BF_CP = "$SbJar"
 `$env:PATH = "$EnvPrefix\Scripts;$(Join-Path $JavaHome 'bin');$BfToolsDir;" + `$env:PATH
-Write-Host "[OK] Activated $EnvName | Java: $JavaHome | bftools: $BfToolsDir | 3i SlideBook6Reader" -ForegroundColor Green
+Write-Host "[OK] Activated $EnvName | Java: $JavaHome | bftools $BfToolsVersion | 3i SlideBook6Reader" -ForegroundColor Green
 "@
 $ActivateContent | Out-File -FilePath $ActivateScript -Encoding utf8
 
@@ -275,18 +303,21 @@ if ($LASTEXITCODE -ne 0 -or ($PyCheck -join " ") -notmatch "PYTHON_OK:") {
     throw "Python verification failed: $PyCheck"
 }
 
-$env:BF_CP = Join-Path $BfToolsDir "SlideBook6Reader.jar"
+$env:BF_CP = $SbJar
 $BfCheck = & $ShowInfBat -version 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0 -or ($BfCheck -notmatch "Bio-Formats" -and $BfCheck -notmatch "Version:")) {
-    throw "Bio-Formats + Java verification failed:`n$BfCheck"
+if ($LASTEXITCODE -ne 0 -or $BfCheck -notmatch [regex]::Escape($BfToolsVersion)) {
+    throw "Bio-Formats $BfToolsVersion + Java verification failed:`n$BfCheck"
+}
+if (-not (Test-Path $SbJar) -or (Get-Item $SbJar).Length -lt 1MB) {
+    throw "3i SlideBook6Reader.jar missing or truncated at $SbJar (re-run setup or check -SbReaderUrl)."
 }
 
 Write-Host "`n======================================================================" -ForegroundColor Green
 Write-Host "[SUCCESS] Local .sld extraction environment verified!" -ForegroundColor Green
 Write-Host "  Python      : $($PyCheck -join ' ')"
 Write-Host "  Java Home   : $JavaHome"
-Write-Host "  Bio-Formats : bftools 7.3.0 ($BfToolsDir)"
-Write-Host "  3i Reader   : SlideBook6Reader.jar present (reads .sld and .sldy)"
+Write-Host "  Bio-Formats : bftools $BfToolsVersion ($BfToolsDir)"
+Write-Host "  3i Reader   : $SbJar (reads SlideBook 6 .sld and 7 .sldy)"
 Write-Host "`nTo activate in PowerShell and run local extraction:"
 Write-Host "  . `"$ActivateScript`"" -ForegroundColor Yellow
 Write-Host "  python scripts\collect_4d_sld_timelapses.py `"D:\RawSLD`" `"D:\Staged_OMETIFF`" --mode extract-ometiff --checksum" -ForegroundColor Yellow
