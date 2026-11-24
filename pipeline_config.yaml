@@ -144,3 +144,99 @@ stage5_tracking_and_mitolandscape:
     process_slice_thickness_um: 0.5 # Geodesic distance bin width along twisted radial process (default: 0.5 um)
     apical_basal_orientation_axis: "Y" # Axis pointing toward ventricular surface for apical (id=2) vs basal (id=3)
     motility_velocity_threshold_um_s: 0.02 # |v_axial| > 0.02 um/s classified as active anterograde/retrograde
+
+# ------------------------------------------------------------------------------------------------
+# Full-archive orchestration (scripts/submit_full_run.bash + scripts/plan_full_run.py).
+# Read by plan_full_run.py with a small standard-library parser: keep this block to nested
+# "key: value" mappings, scalars and inline [lists] (no anchors, no multi-line strings).
+# Playbook: manuals/full_run_playbook.md
+# ------------------------------------------------------------------------------------------------
+hpc_run:
+  primary_cluster: "bora"
+  primary_partition: "batch"
+  large_partition: "hima"         # L-class movies (big memory) go to hima CPU nodes ...
+  large_exclude_gpu_nodes: true   # ... never to the GPU nodes (found live: nodes with a 'gpu' feature/GRES)
+  large_gpu_nodes_fallback: [hi04, hi05, hi07]  # used only when sinfo cannot be queried
+  footprint_fraction: 0.20        # never hold more than 20% of a partition's cores at once
+  partition_cores_fallback:       # used only when sinfo cannot be queried (bora batch 45 x 20 cores)
+    batch: 900
+    hima: 128                     # 4 CPU nodes x 32 cores (GPU nodes excluded)
+  partition_max_mem_gb:           # largest request one node can satisfy (fallbacks; refreshed via sinfo)
+    batch: 120
+    hima: 1000
+  scan_throttle: 20               # concurrent scan tasks (showinf reads .sld over NFS)
+  extract_throttle: 20            # concurrent extraction tasks (bfconvert, I/O-bound)
+  max_array_size: 1000            # bora MaxArraySize is 1001 -> lists are chunked at <= 1000 tasks
+  run_root: ""                    # "" = $MITO_SCRATCH_ROOT/../mito_runs (= /sciclone/scr30/$USER/mito_runs)
+  log_root: ""                    # "" = /sciclone/scr30/$USER/mito_logs
+  job_name_prefix: "mito"
+
+  collector:                      # must be identical for scan and extract
+    min_z: 15
+    min_t: 10
+    min_c: 2
+    compression: "LZW"
+    extract_labels: [MITO]        # mito_label values to extract; files with no label (filter off) always pass
+    files_per_scan_shard: 5       # ~1-3 min of showinf per file -> <= ~15 min per scan task
+
+  scan:
+    cpus: 1
+    mem_gb: 4
+    time: "00:30:00"
+  merge:
+    cpus: 1
+    mem_gb: 2
+    time: "00:15:00"
+  extract:
+    cpus: 2                       # bfconvert JVM
+    mem_gb: 6
+    sec_per_gb: 115               # measured ~9 MB/s per bfconvert stream
+    sec_base: 300                 # JVM start + showinf re-inspection of the file
+    time_unknown: "04:00:00"      # request when the inventory is not merged yet (chained submission)
+  aggregate:
+    cpus: 1
+    mem_gb: 4
+    time: "00:30:00"
+
+  size_classes:                   # by estimated_uncompressed_gb of the movie (inventory)
+    names: [S, M, L]
+    edges_gb: [2.0, 8.0]          # S < 2 GB <= M < 8 GB <= L
+    large_class: "L"              # this class runs on large_partition
+
+  model:                          # seeded from 2026-11-24 measurements; refit from the canary (sacct)
+    stage3_mem_gb_per_gb: 2.75    # peak RSS = 2.5-3x the uncompressed movie ...
+    stage3_mem_gb_base: 0.5       # ... + ~0.5 GB (S20 1.15 GB -> 3.0 GB; S39 1.38 GB -> 3.5 GB)
+    stage3_sec_per_gb: 65         # Stage 3 = 80-90 s for 1.2-1.4 GB raw, linear in size
+    stage3_cpus: 1                # Stages 3 and 5 are single-threaded (job 703660: CPU time = wall time)
+    stage45_cpus: 4               # ilastik threads + parallel watershed frames
+    stage45_mem_gb_per_gb: 2.75   # same per-movie arrays as Stage 3 (mito_norm, probabilities, labels)
+    stage45_mem_gb_base: 1.5      # + ilastik/LazyFlow overhead
+    stage45_mem_per_worker_frame: 8.0  # each parallel watershed worker holds ~8x one frame of one channel
+    ilastik_sec_per_channel_gb: 290    # S20: ~3 min for 10 frames (0.62 GB mito channel) ...
+    ilastik_thread_saturation: 4       # ... speed-up assumed linear up to 4 threads, flat beyond
+    watershed_sec_per_channel_gb: 74   # 7-10 s per frame on S39 (0.115 GB per mito frame)
+    stage5_sec: 60                # Stage 5 ~1 min
+    default_size_t: 10            # used when the inventory has no SizeT for a movie
+    default_size_c: 2
+    time_factor: 2.0              # time request = 2x predicted ...
+    min_time_min: 10              # ... at least 10 min
+    mem_factor: 1.5               # memory request = 1.5x predicted ...
+    min_mem_gb: 2                 # ... at least 2 GB
+    refit_min_scale: 0.5          # canary refit may shrink the model at most 2x ...
+    refit_max_scale: 4.0          # ... and grow it at most 4x
+
+  canary_size: 10                 # ~10 movies spanning the size classes
+  retry_factor: 1.5               # retry: memory and time x 1.5 per attempt
+  max_retries: 2
+
+  overflow:                       # other SciClone clusters, ONLY when bora is saturated (opt-in: --overflow)
+    clusters: [kuro, astral]      # allowlist; [] disables overflow entirely
+    partitions:                   # partition per cluster (kuro 'batch' needs >= 2 whole nodes, so 'serial')
+      kuro: "serial"
+      astral: "batch"
+    deny_clusters: [chesapeake, james, potomac, pamunkey, gulf]
+                                  # chesapeake = the VIMS (Gloucester Point) cluster per W&M RC; james/potomac/
+                                  # pamunkey = its sub-cluster names (unverified, denied to be safe). gulf: not
+                                  # confirmed VIMS, but its partitions are PreemptMode=CANCEL with QOS preemption.
+    require_preempt_mode: "OFF"   # refuse any partition whose live PreemptMode is not OFF
+    pending_threshold_min: 30     # bora counts as saturated when our tasks have waited this long
