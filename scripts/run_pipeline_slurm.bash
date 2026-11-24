@@ -17,6 +17,7 @@
 # Environment:
 #   MITO_DATA_ROOT (and the other MITO_* paths) -> storage locations, see scripts/mito_env.bash
 #   MITO_REPO_DIR                -> repo location if auto-detection fails
+#   MITO_IGNORE_QC=1             -> continue past a Stage 3 FAIL_NO_SIGNAL (exit 3) result
 #   MITO_ALLOW_ILASTIK_FALLBACK=1 -> allow Stage 4 without a trained .ilp (uses the built-in
 #                                   Difference-of-Gaussians foreground estimate; testing only)
 #
@@ -212,8 +213,23 @@ echo "======================================================================"
 # ------------------------------------------------------------------------------
 if has_stage 3; then
     echo "[STAGE 3] Adaptive 4D Preprocessing (drift, crop, cell mask, bleach, normalization)..."
+    # Exit code 3 = FAIL_NO_SIGNAL (raw mito channel indistinguishable from noise): stop before
+    # Stage 4 rather than segment noise. Stage 3 outputs and provenance are still written.
+    STAGE3_RC=0
     python3 "${SCRIPT_DIR}/preprocess_4d_stack.py" \
-        --config "${CONFIG_PATH}" --input "${MOVIE_PATH}" --work-dir "${WORK_DIR}"
+        --config "${CONFIG_PATH}" --input "${MOVIE_PATH}" --work-dir "${WORK_DIR}" || STAGE3_RC=$?
+    if [[ "${STAGE3_RC}" -eq 3 ]]; then
+        if [[ "${MITO_IGNORE_QC:-0}" == "1" ]]; then
+            echo "[QC FAIL] Ignored (MITO_IGNORE_QC=1); continuing to later stages."
+        else
+            cp -p "${WORK_DIR}/${MOVIE_ID}_provenance.json" "${FINAL_OUT_DIR}/" 2>/dev/null || true
+            echo "[QC FAIL] ${MOVIE_ID}: no detectable mito signal; stages after 3 skipped." >&2
+            echo "          Provenance: ${FINAL_OUT_DIR}/${MOVIE_ID}_provenance.json (set MITO_IGNORE_QC=1 to force)." >&2
+            exit 3
+        fi
+    elif [[ "${STAGE3_RC}" -ne 0 ]]; then
+        exit "${STAGE3_RC}"
+    fi
 fi
 if has_stage 4; then
     echo "[STAGE 4] Two-Stage Hybrid Segmentation (ilastik + Cellpose 2D/Z-stitch)..."

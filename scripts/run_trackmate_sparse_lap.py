@@ -23,6 +23,9 @@ Scientific & Algorithmic Sequence:
          connecting them into a single unified lineage tree (connected component).
        * Track Merging (Fusion): Links terminating track ends at frame t-1 to persistent
          target spots at frame t within merging_max_distance_um (default 2.0 um).
+       * Both require signal conservation: parent / (daughter1 + daughter2) total mito intensity
+         (volume if any intensity is 0) within [1/r, r], r = split_merge_max_intensity_ratio (1.5);
+         accepted greedily in order of distance x ratio penalty.
   3. Connected-Component Lineage Tree Construction & TrackMate v7 XML Export:
      - Groups all linked, gap-closed, split, and merged segments into unified Track IDs.
      - Exports complete TrackMate v7.14.0 XML (<Model><AllSpots>..., <AllTracks>...) that opens
@@ -229,6 +232,8 @@ def run_sparse_lap_tracking(
     allow_merge = bool(t_cfg.get("allow_track_merging", True))
     max_merge_dist = float(t_cfg.get("merging_max_distance_um", 2.0))
     min_track_spots = int(t_cfg.get("min_track_spots", 4))
+    # Max allowed parent/(daughter1 + daughter2) signal ratio (and its inverse) for split/merge events
+    max_ratio = max(1.0 + 1e-6, float(t_cfg.get("split_merge_max_intensity_ratio", 1.5)))
 
     # 1. Fast Bounding-Box Spot Extraction
     print(f"[{movie_id}] Extracting 3D spots via fast bounding-box slicing across {n_t} frames...")
@@ -323,74 +328,84 @@ def run_sparse_lap_tracking(
                     out_degree[sp_c["ID"]] += 1
                     in_degree[sp_n["ID"]] += 1
 
-    # 4. Phase II-B: Track Splitting (Mitochondrial Fission) & Merging (Mitochondrial Fusion)
+    # 4. Phase II-B: Track Splitting (Fission) & Merging (Fusion) with a conservation gate.
+    # A split P(t) -> {C1, C2}(t+1) is only plausible if the parent's mito signal is roughly the
+    # sum of its daughters' (Jaqaman et al. 2008 intensity-ratio criterion); likewise for merges.
+    # Without this, every unrelated spot appearing/vanishing within the distance cap becomes an
+    # "event" (the 2026-11-24 pilot produced 470 spurious fissions in frame 0 this way).
+    frame_child: Dict[int, int] = {}
+    frame_parent: Dict[int, int] = {}
+    for e in edges:
+        if e["EVENT_TYPE"] == "FRAME_LINK":
+            frame_child[e["SPOT_SOURCE_ID"]] = e["SPOT_TARGET_ID"]
+            frame_parent[e["SPOT_TARGET_ID"]] = e["SPOT_SOURCE_ID"]
+
+    def _pos(sp: Dict[str, Any]) -> np.ndarray:
+        return np.array([sp["POSITION_X"], sp["POSITION_Y"], sp["POSITION_Z"]], dtype=np.float64)
+
+    def _ratio(whole: Dict[str, Any], part_a: Dict[str, Any], part_b: Dict[str, Any]) -> float:
+        trio = (whole, part_a, part_b)
+        key = "TOTAL_INTENSITY_CH2" if all(sp["TOTAL_INTENSITY_CH2"] > 0 for sp in trio) else "VOLUME"
+        return float(whole[key]) / max(1e-9, float(part_a[key]) + float(part_b[key]))
+
+    def _event_edge(src: Dict[str, Any], tgt: Dict[str, Any], dist: float, cost: float, etype: str) -> None:
+        edges.append({
+            "SPOT_SOURCE_ID": src["ID"],
+            "SPOT_TARGET_ID": tgt["ID"],
+            "LINK_COST": round(cost, 4),
+            "DISPLACEMENT": round(dist, 4),
+            "VELOCITY": round(dist / dt, 4),
+            "DIRECTION_X": round((tgt["POSITION_X"] - src["POSITION_X"]) / max(1e-5, dist), 4),
+            "DIRECTION_Y": round((tgt["POSITION_Y"] - src["POSITION_Y"]) / max(1e-5, dist), 4),
+            "DIRECTION_Z": round((tgt["POSITION_Z"] - src["POSITION_Z"]) / max(1e-5, dist), 4),
+            "EDGE_TIME": round(0.5 * (src["POSITION_T"] + tgt["POSITION_T"]), 2),
+            "EVENT_TYPE": etype,
+        })
+        out_degree[src["ID"]] += 1
+        in_degree[tgt["ID"]] += 1
+
+    r_lo, r_hi = 1.0 / max_ratio, max_ratio
     for t in range(n_t - 1):
         spots_curr = spots_by_frame[t]
         spots_next = spots_by_frame[t + 1]
         if not spots_curr or not spots_next:
             continue
 
-        # Splitting (Fission): Unlinked spot at t+1 branches off a linked parent spot at t
         if allow_split:
-            unlinked_starts = [s for s in spots_next if in_degree[s["ID"]] == 0]
-            active_parents = [s for s in spots_curr if out_degree[s["ID"]] == 1]
-            for sp_n in unlinked_starts:
-                pn = np.array([sp_n["POSITION_X"], sp_n["POSITION_Y"], sp_n["POSITION_Z"]])
-                best_parent = None
-                best_dist = max_split_dist + 1.0
-                for sp_c in active_parents:
-                    if out_degree[sp_c["ID"]] < 2:
-                        pc = np.array([sp_c["POSITION_X"], sp_c["POSITION_Y"], sp_c["POSITION_Z"]])
-                        d = float(np.linalg.norm(pn - pc))
-                        if d <= max_split_dist and d < best_dist:
-                            best_dist = d
-                            best_parent = sp_c
-                if best_parent is not None:
-                    edges.append({
-                        "SPOT_SOURCE_ID": best_parent["ID"],
-                        "SPOT_TARGET_ID": sp_n["ID"],
-                        "LINK_COST": round(best_dist, 4),
-                        "DISPLACEMENT": round(best_dist, 4),
-                        "VELOCITY": round(best_dist / dt, 4),
-                        "DIRECTION_X": round((sp_n["POSITION_X"] - best_parent["POSITION_X"]) / max(1e-5, best_dist), 4),
-                        "DIRECTION_Y": round((sp_n["POSITION_Y"] - best_parent["POSITION_Y"]) / max(1e-5, best_dist), 4),
-                        "DIRECTION_Z": round((sp_n["POSITION_Z"] - best_parent["POSITION_Z"]) / max(1e-5, best_dist), 4),
-                        "EDGE_TIME": round(0.5 * (best_parent["POSITION_T"] + sp_n["POSITION_T"]), 2),
-                        "EVENT_TYPE": "SPLIT_FISSION",
-                    })
-                    out_degree[best_parent["ID"]] += 1
-                    in_degree[sp_n["ID"]] += 1
+            # parent P (t) already continues to C1 (t+1); unlinked C2 (t+1) may be its second daughter
+            candidates = []
+            parents = [sp for sp in spots_curr if out_degree[sp["ID"]] == 1 and sp["ID"] in frame_child]
+            children = [sp for sp in spots_next if in_degree[sp["ID"]] == 0]
+            for par in parents:
+                c1 = spot_lut[frame_child[par["ID"]]]
+                for c2 in children:
+                    d = float(np.linalg.norm(_pos(c2) - _pos(par)))
+                    if d > max_split_dist:
+                        continue
+                    rho = _ratio(par, c1, c2)
+                    if r_lo <= rho <= r_hi:
+                        candidates.append((d * max(rho, 1.0 / rho), d, par, c2))
+            for cost, d, par, c2 in sorted(candidates, key=lambda c: c[0]):
+                if in_degree[c2["ID"]] == 0 and out_degree[par["ID"]] < 2:
+                    _event_edge(par, c2, d, cost, "SPLIT_FISSION")
 
-        # Merging (Fusion): Unlinked terminating spot at t merges into a linked target spot at t+1
         if allow_merge:
-            unlinked_ends = [s for s in spots_curr if out_degree[s["ID"]] == 0]
-            active_targets = [s for s in spots_next if in_degree[s["ID"]] == 1]
-            for sp_c in unlinked_ends:
-                pc = np.array([sp_c["POSITION_X"], sp_c["POSITION_Y"], sp_c["POSITION_Z"]])
-                best_target = None
-                best_dist = max_merge_dist + 1.0
-                for sp_n in active_targets:
-                    if in_degree[sp_n["ID"]] < 2:
-                        pn = np.array([sp_n["POSITION_X"], sp_n["POSITION_Y"], sp_n["POSITION_Z"]])
-                        d = float(np.linalg.norm(pn - pc))
-                        if d <= max_merge_dist and d < best_dist:
-                            best_dist = d
-                            best_target = sp_n
-                if best_target is not None:
-                    edges.append({
-                        "SPOT_SOURCE_ID": sp_c["ID"],
-                        "SPOT_TARGET_ID": best_target["ID"],
-                        "LINK_COST": round(best_dist, 4),
-                        "DISPLACEMENT": round(best_dist, 4),
-                        "VELOCITY": round(best_dist / dt, 4),
-                        "DIRECTION_X": round((best_target["POSITION_X"] - sp_c["POSITION_X"]) / max(1e-5, best_dist), 4),
-                        "DIRECTION_Y": round((best_target["POSITION_Y"] - sp_c["POSITION_Y"]) / max(1e-5, best_dist), 4),
-                        "DIRECTION_Z": round((best_target["POSITION_Z"] - sp_c["POSITION_Z"]) / max(1e-5, best_dist), 4),
-                        "EDGE_TIME": round(0.5 * (sp_c["POSITION_T"] + best_target["POSITION_T"]), 2),
-                        "EVENT_TYPE": "MERGE_FUSION",
-                    })
-                    out_degree[sp_c["ID"]] += 1
-                    in_degree[best_target["ID"]] += 1
+            # target M (t+1) already continues from A (t); unlinked end B (t) may be its second source
+            candidates = []
+            targets = [sp for sp in spots_next if in_degree[sp["ID"]] == 1 and sp["ID"] in frame_parent]
+            ends = [sp for sp in spots_curr if out_degree[sp["ID"]] == 0]
+            for tgt in targets:
+                a = spot_lut[frame_parent[tgt["ID"]]]
+                for b in ends:
+                    d = float(np.linalg.norm(_pos(tgt) - _pos(b)))
+                    if d > max_merge_dist:
+                        continue
+                    rho = _ratio(tgt, a, b)
+                    if r_lo <= rho <= r_hi:
+                        candidates.append((d * max(rho, 1.0 / rho), d, b, tgt))
+            for cost, d, b, tgt in sorted(candidates, key=lambda c: c[0]):
+                if out_degree[b["ID"]] == 0 and in_degree[tgt["ID"]] < 2:
+                    _event_edge(b, tgt, d, cost, "MERGE_FUSION")
 
     # 5. Connected-Component Lineage Graph Construction (Unifying Split & Merged Branches)
     adj: Dict[int, Set[int]] = defaultdict(set)
@@ -452,22 +467,27 @@ def run_sparse_lap_tracking(
         f"[{movie_id}] Exporting spots.csv ({len(filtered_spots)} spots), "
         f"edges.csv ({len(filtered_edges)} links), and tracks.xml..."
     )
-    if filtered_spots:
-        with open(spots_csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(filtered_spots[0].keys()))
-            w.writeheader()
-            w.writerows(filtered_spots)
+    # Always write the CSVs (header-only when empty) so a movie with no kept tracks still yields a
+    # complete, schema-valid deliverable set and Stage 5B does not fail on a missing file.
+    spot_fields = list(filtered_spots[0].keys()) if filtered_spots else [
+        "ID", "NAME", "FRAME", "POSITION_T", "POSITION_X", "POSITION_Y", "POSITION_Z",
+        "MEAN_INTENSITY_CH1", "MEAN_INTENSITY_CH2", "MAX_INTENSITY_CH2", "TOTAL_INTENSITY_CH2",
+        "RADIUS", "VOLUME", "QUALITY", "label_id", "TRACK_ID", "OUT_DEGREE", "IN_DEGREE",
+    ]
+    with open(spots_csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=spot_fields)
+        w.writeheader()
+        w.writerows(filtered_spots)
 
-    if filtered_edges:
-        keys_e = [
-            "TRACK_ID", "SPOT_SOURCE_ID", "SPOT_TARGET_ID", "LINK_COST",
-            "DISPLACEMENT", "VELOCITY", "DIRECTION_X", "DIRECTION_Y",
-            "DIRECTION_Z", "EDGE_TIME", "EVENT_TYPE",
-        ]
-        with open(edges_csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=keys_e, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(filtered_edges)
+    keys_e = [
+        "TRACK_ID", "SPOT_SOURCE_ID", "SPOT_TARGET_ID", "LINK_COST",
+        "DISPLACEMENT", "VELOCITY", "DIRECTION_X", "DIRECTION_Y",
+        "DIRECTION_Z", "EDGE_TIME", "EVENT_TYPE",
+    ]
+    with open(edges_csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys_e, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(filtered_edges)
 
     track_rows = []
     total_fissions = 0

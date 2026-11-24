@@ -87,7 +87,7 @@ stage4_hybrid_segmentation:
     feature_mode: "2D_slices"   # Prevents 1.0 um Z-step blur across adjacent planes
 
   stage4b_instance_segmentation:
-    engine: "cellpose"          # Options: "cellpose" (Cellpose 3, Stringer 2025) or "omnipose" (Cutler 2022)
+    engine: "watershed"         # Default since 2026-11-24 (seeded 3D watershed); "cellpose" (Cellpose 3, GPU-aware) remains an option
     model_type: "cyto3"         # Or path to fine-tuned "bestman_mito_tube.pth"
     input_mode: "dual_channel"  # Stack [Ch1: mito_norm, Ch2: ilastik_prob]
     diameter_px: 8.0            # ~1.28 um characteristic diameter for thin tubules
@@ -162,6 +162,12 @@ stage5_tracking_and_mitolandscape:
      * Cast to `uint16` and save as `<movie_id>_mito_norm.tif` and `<movie_id>_cell_RFP_reg.tif`.
 
 ### Module 2: `run_hybrid_segmentation.py` (Stage 4A ilastik + Stage 4B Cellpose/Omnipose)
+
+> **Updated 2026-11-24:** Stage 4B's default engine is now a **seeded 3D watershed** (`engine: watershed`): h-maxima seeds on distance-to-edge × intensity, with seed spacing and prominence in µm, flooded with `skimage.segmentation.watershed`. It runs on CPU in seconds per frame.
+> - Cellpose (below) remains available as `engine: cellpose` and uses a GPU automatically.
+> - **Purpose of Stage 4B under either engine:** split *touching* mitochondria that share one ilastik foreground region.
+> - On practice Series #39, stock `cyto3` covered 18% of the foreground (watershed 100%); it is a whole-cell model and mitochondria are 2–6 px.
+> - The final choice will be made on a representative real-data sample (`manuals/future_task_representative_sample_validation.md`). The Cellpose description below is kept for that option.
 
 * **Runtime**: Python 3.10+ on HPC GPU node (`cellpose>=3.0`, `tifffile`, `numpy`, plus `ilastik` binary).
 * **Exact Algorithmic Sequence**:

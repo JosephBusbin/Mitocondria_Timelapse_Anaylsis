@@ -126,6 +126,8 @@ class TestMito4DPipelineSuite(unittest.TestCase):
             self.cfg = {}
 
     def tearDown(self):
+        if os.environ.get("MITO_MODELS_DIR", "").startswith(str(self.tmp_dir)):
+            del os.environ["MITO_MODELS_DIR"]  # set by test_08 only
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_01_sld_metadata_and_safety(self):
@@ -402,6 +404,67 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertIn("Problem reading the Image Records", rec.error_summary)
         self.assertIn("aborted acquisition", hint)
 
+    def test_01o_mito_construct_filter_gates_bioformats(self):
+        """--plasmid-csv classifies files by name BEFORE Bio-Formats: under 'require' only MITO files reach
+        showinf (others get SKIPPED_NOT_MITO); under 'report' every file is inspected but still labelled."""
+        if sys.platform.startswith("win"):
+            self.skipTest("Fake showinf shell script requires a POSIX shell")
+        src = self.tmp_dir / "src"
+        (src / "2025").mkdir(parents=True)
+        names = {
+            "05feb2025obf01avc01-B.sld": "MITO_PHOTOACTIVATABLE",  # OBF001 = mito-paGFP
+            "12mar2025jr19jeb09_cell1.sld": "MITO",                 # JR19 = pUAS-mlsEGFPpA
+            "random_cells.sld": "REVIEW",
+        }
+        for name in names:
+            (src / "2025" / name).write_bytes(b"\x01" * 70_000)
+        plasmids = self.tmp_dir / "plasmids.csv"
+        header = ("s,sequenced? (date),does this plasmid make FP positive cells?,glycerol stock?,-20 DNA duplicate?,"
+                  "addgene submission?,plasmid ID,name (Prom_GOI_3'),gateway compnent?,localization sequence?,"
+                  "GOI? tag?,Fluorescent Protein 1 (ME),Fluorescent Protein 2 (3'),p2a,\"uas, MCS, promoter?\","
+                  "antibiotic,plasmid description/elements,full map?,long term use,Forward Primer,Reverse Primer,"
+                  "product size \n")
+        rows = [
+            ",,,,,,OBF001,psox2bd::mitopaGFP_p2a-tagRFPt,-,mito,,paGFP,tagRFPT,p2a,,amp,,,,,,\n",
+            ",,,,,,JR19,pUAS-mlsEGFPpA,,mito,,EGFP,,,UAS,amp,,,,,,\n",
+            ",,,,,,JEB009,pSox2bd_tagRFPt_p2a-tagRFPt,,no,,tagRFPT (middle),tagRFPT (3'),p2a,,amp,,,,,,\n",
+            ",,,,,,avc01,p4XUAS_tagRFPt_p2a-mRuby2,-,-,-,tagRFPt (middle),ruby2,p2a,UAS,amp,,,,,,\n",
+        ]
+        plasmids.write_text(header + "".join(rows), encoding="utf-8")
+        bft = self.tmp_dir / "bft"
+        bft.mkdir()
+        log = self.tmp_dir / "showinf_calls.log"
+        for tool in ("showinf", "bfconvert"):
+            (bft / tool).write_text(
+                "#!/bin/sh\n"
+                'case "$*" in *-version*) echo "Version: fake"; exit 0;; esac\n'
+                f'for a in "$@"; do last="$a"; done; echo "$last" >> "{log}"\n'
+                "echo 'java.lang.AssertionError: Problem reading the Image Records' >&2\nexit 1\n"
+            )
+            (bft / tool).chmod(0o755)
+
+        for mode, expected_inspected in (("require", {"12mar2025jr19jeb09_cell1.sld"}), ("report", set(names))):
+            out = self.tmp_dir / f"out_{mode}"
+            log.write_text("")
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT_DIR / "collect_4d_sld_timelapses.py"), str(src), str(out),
+                 "--mode", "scan-only", "--workers", "1", "--bftools-dir", str(bft),
+                 "--plasmid-csv", str(plasmids), "--mito-filter", mode],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            inspected = {Path(line).name for line in log.read_text().split() if line.endswith(".sld")}
+            self.assertEqual(inspected, expected_inspected, mode)
+            with open(out / "mito_classification.csv", newline="", encoding="utf-8") as f:
+                labels = {Path(r["rel_path"]).name: r["label"] for r in csv.DictReader(f)}
+            self.assertEqual(labels, names, mode)
+            with open(out / "sld_health_audit.csv", newline="", encoding="utf-8") as f:
+                status = {r["sld_filename"]: r["status"] for r in csv.DictReader(f)}
+            skipped = {n for n, st in status.items() if st == "SKIPPED_NOT_MITO"}
+            self.assertEqual(skipped, set(names) - expected_inspected, mode)
+            prov = json.loads((out / "extraction_provenance.json").read_text())
+            self.assertEqual(prov["mito_construct_filter"]["mode"], mode)
+
     def test_01n_inventory_calibration_units(self):
         """Verifies the inventory reports um and seconds even when OME stores nm and DeltaT in ms."""
         series = sld_mod.parse_ome_xml_metadata(
@@ -642,16 +705,120 @@ class TestMito4DPipelineSuite(unittest.TestCase):
                 seg_mod.load_ilastik_probabilities(raw_npy, 2, (2, 3, 4, 5))
 
     @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_03c_large_cumulative_drift_over_fixed_pattern_offset(self):
+        """Drift larger in total than max_shift_xy (12 px/frame, 48 px total) on a camera offset with a
+        static fixed-pattern must be recovered (raw-MIP phase correlation locked onto 0 shift here)."""
+        from scipy import ndimage as ndi
+        rng = np.random.default_rng(3)
+        n_t, n_z, n_y, n_x = 5, 6, 128, 160
+        yy, xx = np.mgrid[:n_y, :n_x]
+        cell = (((yy - 64) / 18.0) ** 2 + ((xx - 50) / 10.0) ** 2 <= 1).astype(np.float32)
+        cell += ((np.abs(yy - 64) <= 2) & (xx > 50) & (xx < 120)).astype(np.float32) * 0.7  # process
+        pattern = np.tile(rng.normal(0, 6.0, size=(1, n_x)), (n_y, 1)).astype(np.float32)   # column FPN
+        stack = np.zeros((n_t, n_z, n_y, n_x), dtype=np.float32)
+        for t in range(n_t):
+            moved = ndi.shift(ndi.gaussian_filter(cell, 1.5), (0, 12.0 * t), order=1)
+            for z in range(n_z):
+                stack[t, z] = 100.0 + pattern + 40.0 * moved * (1.0 if 1 <= z <= 4 else 0.3)
+        stack += rng.normal(0, 2.0, size=stack.shape).astype(np.float32)
+        sx, sy, sz = prep_mod.estimate_fast4dreg_drift(stack, max_shift_xy=25, max_shift_z=5)
+        np.testing.assert_allclose(sx, [-12.0 * t for t in range(n_t)], atol=1.0)
+        np.testing.assert_allclose(sy, np.zeros(n_t), atol=1.0)
+        np.testing.assert_allclose(sz, np.zeros(n_t), atol=0.6)
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_03b_haze_removed_before_gating_and_raw_contrast_qc(self):
+        """Top-hat must run before gating (thin hazy processes must not keep their haze), and the raw
+        contrast QC must fail pure noise but pass a stack with real puncta."""
+        stack = np.full((1, 1, 80, 80), 1000.0, dtype=np.float32)   # uniform haze everywhere (raw)
+        stack[0, 0, 38:42, 40:43] = 6000.0                          # one mitochondrion on a thin process
+        gate = np.zeros((1, 80, 80), dtype=bool)
+        gate[0, 36:44, 10:70] = True                                # 8 px wide process << 31 px kernel
+        prep_mod.remove_haze_then_gate_inplace(stack, gate, radius_px=15)
+        process = stack[0, 0][gate[0]]
+        self.assertLess(float(np.median(process)), 100.0)          # haze stripped inside the process
+        self.assertGreater(float(stack[0, 0, 40, 41]), 3000.0)    # mitochondrion kept
+        self.assertEqual(float(stack[0, 0, 10, 10]), 0.0)          # outside the gate is zero
+
+        rng = np.random.default_rng(0)
+        calib = {"dx_um": 0.2, "dy_um": 0.2, "dz_um": 1.0, "dt_s": 10.0}
+        cell = np.zeros((5, 120, 120), dtype=bool)
+        cell[1:4, 40:80, 40:80] = True
+        noise = rng.normal(100.0, 3.0, size=(6, 5, 120, 120)).astype(np.float32)
+        qc_noise = prep_mod.measure_raw_mito_contrast(noise, cell, calib)
+        self.assertLess(qc_noise["contrast_sigma"], 3.0)
+        with_mito = noise.copy()
+        for y, x in ((50, 50), (60, 70), (72, 55)):
+            with_mito[:, 2, y:y + 3, x:x + 3] += 40.0               # ~13 sigma puncta
+        qc_mito = prep_mod.measure_raw_mito_contrast(with_mito, cell, calib)
+        self.assertGreater(qc_mito["contrast_sigma"], 3.0)
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_05d_watershed_splits_touching_but_not_single_rods(self):
+        """The default Stage 4B engine must split two TOUCHING mitochondria in one foreground region, yet
+        keep a single elongated rod (spanning 3 Z-slices) as ONE object; unknown engines are rejected."""
+        from scipy import ndimage as ndi
+        calib = {"dx_um": 0.19, "dy_um": 0.19, "dz_um": 1.0, "dt_s": 120.0}
+        shape = (6, 40, 60)
+        # Two touching blobs end-to-end along X, joined by a narrow, dimmer neck (one foreground region)
+        pair = np.zeros(shape, np.float32)
+        pair[2:4, 15:22, 10:20] = 1.0
+        pair[2:4, 15:22, 23:33] = 1.0
+        pair[2:4, 17:20, 20:23] = 0.6
+        inten = ndi.gaussian_filter(pair, (0.5, 1.0, 1.0))
+        fg = inten > 0.2
+        self.assertEqual(ndi.label(fg)[1], 1)                      # truly touching: one connected region
+        labels = seg_mod.watershed_split_3d(fg, inten, calib)
+        self.assertEqual(len(np.unique(labels[fg])), 2)
+        # One rod 12 px long, 4 px wide, 3 slices deep -> exactly one instance
+        rod = np.zeros(shape, np.float32)
+        rod[1:4, 18:22, 20:32] = 1.0
+        rod_i = ndi.gaussian_filter(rod, (0.6, 1.0, 1.0))
+        rod_fg = rod_i > 0.2
+        self.assertEqual(len(np.unique(seg_mod.watershed_split_3d(rod_fg, rod_i, calib)[rod_fg])), 1)
+        # Two touching small puncta (3x3 px, centres 0.76 um apart) -> two instances
+        pp = np.zeros(shape, np.float32)
+        pp[2, 18:21, 18:21] = 1.0
+        pp[2, 18:21, 22:25] = 1.0
+        pp_i = ndi.gaussian_filter(pp, (0.5, 1.0, 1.0))
+        pp_fg = pp_i > 0.15
+        self.assertEqual(ndi.label(pp_fg)[1], 1)
+        self.assertEqual(len(np.unique(seg_mod.watershed_split_3d(pp_fg, pp_i, calib)[pp_fg])), 2)
+        # Engine dispatch
+        cfg = json.loads(json.dumps(self.cfg))
+        b = cfg["stage4_hybrid_segmentation"]["stage4b_instance_segmentation"]
+        self.assertEqual(b["engine"], "watershed")
+        labels4, used = seg_mod.segment_instances(rod_i[None] * 50000, rod_i[None], cfg, calib)
+        self.assertEqual(used, "watershed")
+        self.assertEqual(int(labels4.max()), 1)
+        b["engine"] = "stardist"
+        with self.assertRaises(ValueError):
+            seg_mod.segment_instances(rod_i[None] * 50000, rod_i[None], cfg, calib)
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_05c_instances_gated_by_ilastik_probability(self):
+        """Stage 4B drops instances that ilastik does not call mitochondria (mean P below threshold)."""
+        masks = np.zeros((1, 20, 20), dtype=np.int32)
+        masks[0, 2:6, 2:6] = 1      # on foreground
+        masks[0, 10:14, 10:14] = 2  # on background (noise object)
+        prob = np.zeros((1, 20, 20), dtype=np.float32)
+        prob[0, 2:6, 2:6] = 0.9
+        prob[0, 10:14, 10:14] = 0.1
+        gated = seg_mod.gate_instances_by_probability(masks, prob, 0.5)
+        self.assertEqual(sorted(np.unique(gated).tolist()), [0, 1])
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_06_sparse_lap_tracking_gap_fission_fusion(self):
         """Verifies gap closing, track splitting (fission), merging (fusion), and TrackMate v7 XML validity."""
         # Create a 5-frame label stack (T=5, Z=6, Y=64, X=64)
         labels = np.zeros((5, 6, 64, 64), dtype=np.uint16)
         norm = np.full((5, 6, 64, 64), 10000, dtype=np.uint16)
 
-        # Track 1: Present at T=0, missing at T=1 (gap!), present at T=2, splits into two at T=3 and T=4
-        labels[0, 3, 10:13, 10:13] = 1
+        # Track 1: Present at T=0, missing at T=1 (gap!), present at T=2, splits into two at T=3 and T=4.
+        # The parent (6x3 = 18 voxels) is twice a daughter (3x3 = 9), so the split conserves signal.
+        labels[0, 3, 9:15, 10:13] = 1
         # T=1 gap (label 1 absent)
-        labels[2, 3, 11:14, 10:13] = 1
+        labels[2, 3, 10:16, 10:13] = 1
         # T=3 Fission: parent splits into daughter A (y=10) and daughter B (y=16)
         labels[3, 3, 9:12, 10:13] = 1
         labels[3, 3, 15:18, 10:13] = 2
@@ -678,6 +845,26 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         root = xml_tree.getroot()
         self.assertIsNotNone(root.find(".//AllSpots"))
         self.assertIsNotNone(root.find(".//AllTracks"))
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_06b_unconserved_appearance_is_not_fission(self):
+        """A new, unrelated spot appearing next to a persisting one must not be called a fission."""
+        labels = np.zeros((5, 4, 40, 40), dtype=np.uint16)
+        norm = np.full((5, 4, 40, 40), 10000, dtype=np.uint16)
+        for t in range(5):
+            labels[t, 2, 10:13, 10:13] = 1          # persisting mitochondrion (9 voxels)
+            if t >= 2:
+                labels[t, 2, 14:17, 10:13] = 2      # equal-size newcomer 0.64 um away from t=2 on
+        lbl_path = self.tmp_dir / "appear_mito_labels.tif"
+        norm_path = self.tmp_dir / "appear_mito_norm.tif"
+        write_tiff(lbl_path, labels)
+        write_tiff(norm_path, norm)
+        calib = {"dx_um": 0.16, "dy_um": 0.16, "dz_um": 1.0, "dt_s": 11.7}
+        _, _, _, n_fiss, n_fuse = track_mod.run_sparse_lap_tracking(
+            lbl_path, norm_path, self.tmp_dir, "appear", self.cfg, calib
+        )
+        self.assertEqual(n_fiss, 0)  # parent/(d1+d2) = 0.5 fails the 1.5x conservation gate
+        self.assertEqual(n_fuse, 0)
 
     @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_07_curved_arbor_internal_geodesic_and_swc(self):
@@ -715,26 +902,53 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertGreater(len(lines), 5)
 
     @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_07b_outside_mask_spots_and_nonnegative_soma_distance(self):
+        """Spots just outside the cell snap to it; far-outside spots are 'outside_cell' (NaN distance),
+        never silently 'basal_process' at distance 0; soma distances are >= 0."""
+        calib = {"dx_um": 0.5, "dy_um": 0.5, "dz_um": 1.0, "dt_s": 10.0}
+        cell = np.zeros((3, 40, 40), dtype=bool)
+        cell[:, 5:35, 5:20] = True
+        soma = np.zeros_like(cell)
+        soma[:, 5:15, 5:20] = True
+        geo = ml_mod.compute_internal_geodesic_distance_3d(cell, soma, calib)
+        self.assertGreaterEqual(float(geo.min()), 0.0)
+        comp = np.where(soma, 1, np.where(cell, 3, 0)).astype(np.uint8)
+        labels = np.zeros((1, 3, 40, 40), dtype=np.uint16)
+        labels[0, 1, 25:27, 10:12] = 1   # inside the process
+        labels[0, 1, 25:27, 20:22] = 2   # 1-2 px (0.5-1.0 um) outside the mask edge -> snapped
+        labels[0, 1, 25:27, 32:34] = 3   # 6+ um outside -> outside_cell
+        feats, _, _ = ml_mod.profile_all_instances_fast(labels, calib, geo, comp, cell_mask=cell, snap_um=1.5)
+        self.assertEqual(feats[(0, 1)]["compartment_name"], "basal_process")
+        self.assertGreater(feats[(0, 1)]["geodesic_soma_dist_um"], 0.0)
+        self.assertEqual(feats[(0, 2)]["compartment_name"], "basal_process")
+        self.assertGreater(feats[(0, 2)]["geodesic_soma_dist_um"], 0.0)
+        self.assertEqual(feats[(0, 3)]["compartment_name"], "outside_cell")
+        self.assertTrue(np.isnan(feats[(0, 3)]["geodesic_soma_dist_um"]))
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_08_end_to_end_pipeline_integration(self):
         """Executes Modules 1 through 4 end-to-end on a synthetic 4D dual-channel movie."""
         movie_id = "e2e_synthetic"
         movie_path = self.tmp_dir / f"{movie_id}.ome.tif"
 
-        # Generate 5D (T=5, C=2, Z=8, Y=64, X=64) movie
-        data = np.zeros((5, 2, 8, 64, 64), dtype=np.uint16)
-        zz, yy, xx = np.ogrid[:8, :64, :64]
-        for t in range(5):
-            # Cytosol (Ch 1): Soma at y=15, x=32 + shaft to y=55
-            soma = ((zz - 4) ** 2 * 2 + (yy - 15) ** 2 + (xx - 32) ** 2) <= 36
-            data[t, 1][soma] = 4000
-            data[t, 1, 3:6, 15:55, 30:35] = 2800
-            data[t, 1] += 150
-
-            # Mitochondria (Ch 0): 1 in soma, 1 moving anterograde along shaft
-            data[t, 0, 4, 14:17, 31:34] = 8000
-            my = 22 + t * 2
-            data[t, 0, 4, my : my + 3, 31:34] = 9500
-            data[t, 0] += 120
+        # Realistic 5D (T=5, C=2, Z=10, Y=96, X=96) movie: camera offset 100 + read noise SD 3,
+        # cytosol (Ch 2) soma + shaft, and exactly TWO blurred mitochondrial rods (Ch 1) spanning
+        # 3 Z-slices: one static in the soma, one moving +3 px (0.48 um) per frame along the shaft.
+        from scipy import ndimage as ndi
+        rng = np.random.default_rng(7)
+        n_t, n_z, n_y, n_x = 5, 10, 96, 96
+        movie = np.zeros((n_t, 2, n_z, n_y, n_x), dtype=np.float32)
+        zz, yy, xx = np.ogrid[:n_z, :n_y, :n_x]
+        for t in range(n_t):
+            soma = ((zz - 5) ** 2 * 4 + (yy - 22) ** 2 + (xx - 48) ** 2) <= 14 ** 2
+            shaft = (np.abs(zz - 5) <= 2) & (yy >= 22) & (yy < 88) & (np.abs(xx - 48) <= 4)
+            movie[t, 1][soma | shaft] = 300.0
+            rods = np.zeros((n_z, n_y, n_x), dtype=np.float32)
+            rods[4:7, 16:20, 40:48] = 1.0
+            rods[4:7, 40 + 3 * t : 48 + 3 * t, 46:50] = 1.0
+            movie[t, 0] = ndi.gaussian_filter(rods, (0.6, 1.0, 1.0)) * 400.0
+        movie += rng.normal(100.0, 3.0, size=movie.shape)
+        data = np.clip(movie, 0, 65535).astype(np.uint16)
 
         write_tiff(
             movie_path,
@@ -744,6 +958,9 @@ class TestMito4DPipelineSuite(unittest.TestCase):
 
         # Run Module 1
         prep_mod.preprocess_movie(movie_path, self.tmp_dir, self.cfg)
+        # Point models_dir at an empty folder so Stage 4 deterministically uses the built-in
+        # estimator instead of whatever real .ilp is installed in $MITO_MODELS_DIR.
+        os.environ["MITO_MODELS_DIR"] = str(self.tmp_dir / "no_models")
         # Run Module 2
         subprocess.run(
             [
@@ -796,6 +1013,20 @@ class TestMito4DPipelineSuite(unittest.TestCase):
             f_path = self.tmp_dir / f"{movie_id}{suffix}"
             self.assertTrue(f_path.exists(), f"Missing output file: {f_path.name}")
             self.assertGreater(f_path.stat().st_size, 0, f"Empty output file: {f_path.name}")
+
+        # The outputs must also be RIGHT, not just present: 2 rods per frame, no invented events,
+        # and the moving rod's links match its true 0.48 um/frame displacement.
+        prov = json.loads((self.tmp_dir / f"{movie_id}_provenance.json").read_text())
+        self.assertEqual(prov["stage3_preprocessing_metrics"]["qc_status"], "PASS")
+        labels, _ = read_tiff(self.tmp_dir / f"{movie_id}_mito_labels.tif", axes="TZYX")
+        self.assertEqual([int(len(np.unique(labels[t])) - 1) for t in range(labels.shape[0])], [2] * n_t)
+        with open(self.tmp_dir / f"{movie_id}_edges.csv", newline="") as f:
+            edges = list(csv.DictReader(f))
+        self.assertFalse([e for e in edges if e["EVENT_TYPE"] in ("SPLIT_FISSION", "MERGE_FUSION")])
+        moves = sorted(float(e["DISPLACEMENT"]) for e in edges if e["EVENT_TYPE"] == "FRAME_LINK")
+        self.assertEqual(len(moves), 2 * (n_t - 1))
+        self.assertLess(moves[n_t - 2], 0.15)                  # static rod: ~0 um per frame
+        self.assertAlmostEqual(moves[-1], 0.48, delta=0.12)    # moving rod: 3 px x 0.16 um
 
 
 def ndimage_com(vol) -> Tuple[float, float, float]:

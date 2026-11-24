@@ -30,6 +30,17 @@ SLURM Manifest Paths (movie_list.txt):
   --hpc-raw-root or the MITO_RAW_ROOT environment variable supplies an absolute prefix. Relative
   entries are resolved against $MITO_RAW_ROOT at job run time, so the same manifest works no
   matter which storage location (personal or shared lab) the data lands in.
+
+Sharded runs (SLURM job arrays, see scripts/submit_full_run.bash):
+  --shard K/N      processes only every N-th candidate file (sorted list, round-robin, K = 1..N), so
+                   N array tasks together cover every file exactly once.
+  --file-list F    processes only the files named in F (one path per line, absolute or relative to
+                   source_dir) instead of searching source_dir recursively.
+  --report-dir D   where the CSV/JSON reports go (default: output_dir).
+  With --shard, every report gets a '_shardK' suffix (e.g. sld_4d_inventory_shard3.csv) so
+  concurrent tasks never overwrite each other; scripts/merge_collect_shards.py combines them.
+  With --shard or --file-list, 'extract-ometiff' exits with code 4 if any extraction failed, so
+  Slurm marks the task FAILED and it can be retried.
 """
 
 import argparse
@@ -75,6 +86,11 @@ class SeriesMetadata:
     is_4d_timelapse: bool
     calibration_complete: bool
     extracted_ometiff_relpath: str
+    # Mito-construct filename classification (construct_classifier.py; empty when --mito-filter off)
+    mito_label: str = ""
+    mito_fp: str = ""
+    mito_color: str = ""
+    red_mito_flag: bool = False
 
 
 @dataclass
@@ -762,6 +778,69 @@ def manifest_entry(hpc_root: str, relpath: str) -> str:
     return f"{hpc_root}/{relpath}" if hpc_root else relpath
 
 
+SLD_EXTENSIONS = {".sld", ".sldy"}
+
+
+def parse_shard_spec(spec: Optional[str]) -> Optional[Tuple[int, int]]:
+    """
+    Parses '--shard K/N' into (K, N) with 1 <= K <= N. Returns None when spec is empty.
+    Raises ValueError for malformed specs so a bad array index never silently scans everything.
+    """
+    if not spec:
+        return None
+    match = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", spec)
+    if not match:
+        raise ValueError(f"--shard must look like K/N (e.g. 3/20), got '{spec}'")
+    k, n = int(match.group(1)), int(match.group(2))
+    if n < 1 or not 1 <= k <= n:
+        raise ValueError(f"--shard K/N needs 1 <= K <= N, got '{spec}'")
+    return k, n
+
+
+def select_shard(paths: List[Path], shard_index: int, shard_count: int) -> List[Path]:
+    """
+    Deterministic round-robin split: shard K (1-based) of N takes items K-1, K-1+N, K-1+2N, ...
+    of the given (already sorted) list. The N shards are disjoint and together cover every item
+    exactly once; round-robin (not contiguous blocks) spreads large cohort folders across shards.
+    """
+    return [p for i, p in enumerate(paths) if i % shard_count == shard_index - 1]
+
+
+def read_file_list(list_path: Path, source_dir: Path) -> List[Path]:
+    """
+    Reads a --file-list: one .sld/.sldy path per line, absolute or relative to source_dir.
+    Blank lines and '#' comments are ignored; Windows CRLF is tolerated. Duplicates are dropped.
+    Every path must lie inside source_dir (relative paths and cohort folders derive from it).
+    """
+    seen = set()
+    files: List[Path] = []
+    with open(list_path, "r", encoding="utf-8-sig") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            p = Path(line)
+            if not p.is_absolute():
+                p = source_dir / p
+            p = p.resolve()
+            try:
+                p.relative_to(source_dir)
+            except ValueError:
+                raise ValueError(f"--file-list entry is outside source_dir {source_dir}: {line}")
+            if p not in seen:
+                seen.add(p)
+                files.append(p)
+    return files
+
+
+def shard_report_name(filename: str, suffix: str) -> str:
+    """Inserts the shard suffix before the extension: 'sld_4d_inventory.csv' -> 'sld_4d_inventory_shard3.csv'."""
+    if not suffix:
+        return filename
+    stem, dot, ext = filename.rpartition(".")
+    return f"{stem}{suffix}.{ext}" if dot else f"{filename}{suffix}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Filter 3i SlideBook (.sld) files for 4D time-lapse series, audit file health, and stage/extract for W&M SciClone HPC."
@@ -805,8 +884,57 @@ def main() -> int:
     parser.add_argument("--hardlink", action="store_true", help="Use hardlinks instead of copying in 'copy-sld' mode")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing extracted files")
     parser.add_argument("--dry-run", action="store_true", help="Simulate extraction/staging without writing image files")
+    parser.add_argument(
+        "--plasmid-csv",
+        type=Path,
+        default=Path(os.environ["MITO_PLASMID_CSV"]) if os.environ.get("MITO_PLASMID_CSV") else None,
+        help="Lab plasmid table CSV for the mito-construct filename filter (default: $MITO_PLASMID_CSV). "
+        "See manuals/construct_filter_guide.md.",
+    )
+    parser.add_argument("--construct-lexicon", type=Path, default=None,
+                        help="Lexicon JSON for the filter (default: config/construct_lexicon.json)")
+    parser.add_argument("--mito-overrides", type=Path, default=None,
+                        help="Manual overrides CSV (pattern,label,note); first match wins over heuristics")
+    parser.add_argument(
+        "--mito-filter",
+        choices=["off", "report", "require"],
+        default=None,
+        help="off: no classification; report: classify and report only; require: only files labelled MITO "
+        "are inspected/extracted, others get health status SKIPPED_NOT_MITO "
+        "(default: require when --plasmid-csv is given, else off)",
+    )
+    parser.add_argument(
+        "--shard",
+        type=str,
+        default=None,
+        help="Process only shard K of N (format K/N, 1-based; deterministic round-robin over the sorted "
+        "candidate list). Reports get a '_shardK' suffix. Used by Slurm job arrays.",
+    )
+    parser.add_argument(
+        "--file-list",
+        type=Path,
+        default=None,
+        help="Process only the .sld/.sldy files listed in this text file (one per line, absolute or "
+        "relative to source_dir) instead of searching source_dir recursively.",
+    )
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=None,
+        help="Directory for the CSV/JSON/movie_list reports (default: output_dir). Extracted images "
+        "always go to output_dir.",
+    )
 
     args = parser.parse_args()
+    if args.mito_filter is None:
+        args.mito_filter = "require" if args.plasmid_csv else "off"
+    try:
+        shard = parse_shard_spec(args.shard)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    shard_suffix = f"_shard{shard[0]}" if shard else ""
+    orchestrated = shard is not None or args.file_list is not None
 
     if not args.source_dir.exists():
         print(f"[ERROR] Source directory does not exist: {args.source_dir}", file=sys.stderr)
@@ -821,6 +949,8 @@ def main() -> int:
     args.source_dir = args.source_dir.resolve()
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    report_dir = (args.report_dir or args.output_dir).resolve()
+    report_dir.mkdir(parents=True, exist_ok=True)
     showinf_bin, bfconvert_bin = resolve_bftools_binaries(args.bftools_dir)
     showinf_bin = str(Path(showinf_bin).resolve()) if Path(showinf_bin).exists() else showinf_bin
     bfconvert_bin = str(Path(bfconvert_bin).resolve()) if Path(bfconvert_bin).exists() else bfconvert_bin
@@ -852,12 +982,27 @@ def main() -> int:
             sub_env["BF_CP"] = f"{sb_jar}{os.pathsep}{curr_cp}".rstrip(os.pathsep)
         print(f"Using 3i SlideBook native reader JAR: {sb_jar}")
 
-    raw_candidates = sorted(
-        [p for p in args.source_dir.rglob("*") if p.is_file() and p.suffix.lower() in {".sld", ".sldy"}]
-    )
-    if not raw_candidates:
+    if args.file_list is not None:
+        try:
+            listed = read_file_list(args.file_list, args.source_dir)
+        except (OSError, ValueError) as exc:
+            print(f"[ERROR] Cannot read --file-list {args.file_list}: {exc}", file=sys.stderr)
+            return 1
+        # Listed files that vanished still get a health row (UNREADABLE_FILE) below via stat().
+        raw_candidates = sorted(p for p in listed if p.suffix.lower() in SLD_EXTENSIONS)
+    else:
+        raw_candidates = sorted(
+            [p for p in args.source_dir.rglob("*") if p.is_file() and p.suffix.lower() in SLD_EXTENSIONS]
+        )
+    n_candidates_total = len(raw_candidates)
+    if shard:
+        raw_candidates = select_shard(raw_candidates, shard[0], shard[1])
+        print(f"[INFO] Shard {shard[0]}/{shard[1]}: {len(raw_candidates)} of {n_candidates_total} candidate file(s).")
+    if not raw_candidates and not orchestrated:
         print(f"[WARNING] No .sld or .sldy files found under {args.source_dir}")
         return 0
+    # Orchestrated (sharded / file-list) runs continue with an empty list so every shard still writes
+    # its (empty) reports; merge_collect_shards.py then knows the shard finished.
 
     sld_files: List[Path] = []
     health_records: List[FileHealthRecord] = []
@@ -892,6 +1037,49 @@ def main() -> int:
     if health_records:
         print(f"[INFO] Pre-filtered {len(health_records)} non-data/stub file(s) (< 64 KB, temp locks, or unreadable).")
 
+    # Mito-construct filename filter (names only: runs before any Bio-Formats call, so non-mito files
+    # cost nothing under --mito-filter require).
+    mito_calls: Dict[str, object] = {}
+    if args.mito_filter != "off":
+        try:
+            import construct_classifier as cc
+            lexicon = cc.load_lexicon(args.construct_lexicon)
+            table = cc.load_construct_table(args.plasmid_csv, lexicon) if args.plasmid_csv else None
+            overrides = cc.load_overrides(args.mito_overrides)
+        except Exception as exc:  # bad CSV/lexicon/overrides must stop the run, not silently disable filtering
+            print(f"[ERROR] Mito-construct filter setup failed: {exc}", file=sys.stderr)
+            return 2
+        kept: List[Path] = []
+        for p in sld_files:
+            rel = p.relative_to(args.source_dir).as_posix()
+            call = cc.classify_name(rel, table, lexicon, overrides)
+            mito_calls[str(p)] = call
+            if args.mito_filter == "require" and call.label != "MITO":
+                health_records.append(make_health_record(
+                    p, args.source_dir, "SKIPPED_NOT_MITO",
+                    f"{call.label}: {call.reasons}", probe_header=False,
+                ))
+            else:
+                kept.append(p)
+        if shard_suffix:
+            # write_reports uses fixed file names: write into a private temp folder, then move the
+            # files to their '_shardK' names so concurrent shards never clobber each other.
+            tmp_report = Path(tempfile.mkdtemp(prefix=f".mito_reports{shard_suffix}_", dir=str(report_dir)))
+            try:
+                for written in cc.write_reports(list(mito_calls.values()), tmp_report):
+                    os.replace(written, report_dir / shard_report_name(Path(written).name, shard_suffix))
+            finally:
+                shutil.rmtree(tmp_report, ignore_errors=True)
+        else:
+            cc.write_reports(list(mito_calls.values()), report_dir)
+        label_counts: Dict[str, int] = {}
+        for call in mito_calls.values():
+            label_counts[call.label] = label_counts.get(call.label, 0) + 1
+        print(f"[INFO] Mito-construct filter ({args.mito_filter}): {label_counts}; "
+              f"see mito_classification{shard_suffix}.csv / mito_review{shard_suffix}.csv in {report_dir}")
+        if args.mito_filter == "require":
+            sld_files = kept
+
     total_raw_gb = sum(p.stat().st_size for p in sld_files) / (1024 ** 3)
     print(f"Found {len(sld_files)} valid SlideBook container(s) ({total_raw_gb:.2f} GB total raw container size).")
     print(f"Filtering criteria: SizeZ >= {args.min_z}, SizeT >= {args.min_t}, SizeC >= {args.min_c}")
@@ -925,6 +1113,11 @@ def main() -> int:
                     f"[WARN] [{health_rec.status}] Skipping {sld.name} ({health_rec.file_size_mb:.1f} MB): {hint}",
                     file=sys.stderr,
                 )
+            call = mito_calls.get(str(sld))
+            if call is not None:
+                for s in series_list:
+                    s.mito_label, s.mito_fp = call.label, call.mito_fp
+                    s.mito_color, s.red_mito_flag = call.mito_color, call.red_mito_flag
             all_series.extend(series_list)
             for s in series_list:
                 if s.is_4d_timelapse:
@@ -937,9 +1130,10 @@ def main() -> int:
     n_unhealthy = sum(1 for r in health_records if r.status not in HEALTHY_STATUSES)
 
     # 1. Write Master CSV Inventory
-    manifest_csv = args.output_dir / "sld_4d_inventory.csv"
-    if all_series:
-        fieldnames = list(asdict(all_series[0]).keys())
+    manifest_csv = report_dir / shard_report_name("sld_4d_inventory.csv", shard_suffix)
+    if all_series or orchestrated:
+        # Orchestrated shards always write the header, even when empty, so the merge sees them.
+        fieldnames = list(SeriesMetadata.__dataclass_fields__.keys())
         with open(manifest_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -947,7 +1141,7 @@ def main() -> int:
                 writer.writerow(asdict(s))
 
     # 1b. Write file-level health audit (one row per candidate file: pass, skip, or failure)
-    health_csv = args.output_dir / "sld_health_audit.csv"
+    health_csv = report_dir / shard_report_name("sld_health_audit.csv", shard_suffix)
     with open(health_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(FileHealthRecord.__dataclass_fields__.keys()))
         writer.writeheader()
@@ -956,7 +1150,7 @@ def main() -> int:
 
     # 2. Write SLURM Job Array Manifests (movie_list.txt + per-year lists)
     hpc_root = (args.hpc_raw_root or "").rstrip("/")
-    master_list_path = args.output_dir / "movie_list.txt"
+    master_list_path = report_dir / shard_report_name("movie_list.txt", shard_suffix)
     by_year: Dict[str, List[str]] = {}
     with open(master_list_path, "w", encoding="utf-8") as f:
         for s in qualifying_series:
@@ -965,7 +1159,7 @@ def main() -> int:
             by_year.setdefault(s.cohort_year, []).append(hpc_path)
 
     for yr, paths in by_year.items():
-        yr_list_path = args.output_dir / f"movie_list_{yr}.txt"
+        yr_list_path = report_dir / shard_report_name(f"movie_list_{yr}.txt", shard_suffix)
         with open(yr_list_path, "w", encoding="utf-8") as f:
             for p in paths:
                 f.write(f"{p}\n")
@@ -991,9 +1185,13 @@ def main() -> int:
             "workers": args.workers,
         },
         "slidebook_reader_jar": sb_jar or "not_found",
+        "report_dir": str(report_dir),
+        "shard": {"index": shard[0], "count": shard[1]} if shard else None,
+        "file_list": str(args.file_list.resolve()) if args.file_list else None,
         "movie_list_root": hpc_root or "relative (resolve against $MITO_RAW_ROOT)",
         "summary_metrics": {
             "total_sld_candidates_found": len(raw_candidates),
+            "total_sld_candidates_before_sharding": n_candidates_total,
             "total_sld_files_scanned": len(sld_files),
             "total_unparseable_or_skipped": n_unhealthy,
             "total_raw_sld_gb": round(total_raw_gb, 3),
@@ -1004,8 +1202,18 @@ def main() -> int:
             "cohorts_discovered": {yr: len(paths) for yr, paths in by_year.items()},
         },
         "health_audit_by_year": health_by_year,
+        "mito_construct_filter": {
+            "mode": args.mito_filter,
+            "plasmid_csv": str(args.plasmid_csv) if args.plasmid_csv else None,
+            "overrides_csv": str(args.mito_overrides) if args.mito_overrides else None,
+            "label_counts": {
+                lab: sum(1 for c in mito_calls.values() if c.label == lab)
+                for lab in sorted({c.label for c in mito_calls.values()})
+            },
+            "red_mito_files": sorted(Path(k).name for k, c in mito_calls.items() if c.red_mito_flag),
+        },
     }
-    prov_json_path = args.output_dir / "extraction_provenance.json"
+    prov_json_path = report_dir / shard_report_name("extraction_provenance.json", shard_suffix)
     with open(prov_json_path, "w", encoding="utf-8") as f:
         json.dump(provenance_log, f, indent=2)
 
@@ -1020,6 +1228,11 @@ def main() -> int:
     print(f"SLURM array list saved to         : {master_list_path}"
           + ("" if hpc_root else " (relative paths; resolved against $MITO_RAW_ROOT)"))
     print(f"Checkpoint 2 provenance saved to  : {prov_json_path}")
+    if mito_calls:
+        n_red = sum(1 for c in mito_calls.values() if c.red_mito_flag)
+        print(f"Mito-construct filter ({args.mito_filter:7s}): "
+              + ", ".join(f"{lab}={n}" for lab, n in provenance_log["mito_construct_filter"]["label_counts"].items())
+              + (f"; {n_red} red-mito file(s): check channel_mito/channel_cell order" if n_red else ""))
 
     print("\n--- File Health by Cohort Year ---")
     for yr, counts in health_by_year.items():
@@ -1032,6 +1245,7 @@ def main() -> int:
     if args.mode == "extract-ometiff":
         print(f"\nExtracting {len(qualifying_series)} qualifying 4D series to {args.compression}-compressed .ome.tif...")
         total_out_gb = 0.0
+        n_extract_failed = 0
         checksums: Dict[str, str] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {
@@ -1052,16 +1266,21 @@ def main() -> int:
                 meta = futures[fut]
                 ok, msg, sz, sha = fut.result()
                 print(f"  [{'OK' if ok else 'ERR'}] {msg}")
+                n_extract_failed += 0 if ok else 1
                 total_out_gb += sz
                 if sha:
                     checksums[meta.extracted_ometiff_relpath] = sha
 
         if checksums:
-            sha_path = args.output_dir / "extracted_checksums.sha256"
+            sha_path = report_dir / shard_report_name("extracted_checksums.sha256", shard_suffix)
             with open(sha_path, "w", encoding="utf-8") as f:
                 for rel_p, digest in sorted(checksums.items()):
                     f.write(f"{digest}  {rel_p}\n")
         print(f"\nCompleted extraction: {total_out_gb:.2f} GB written to {args.output_dir}")
+        if n_extract_failed and orchestrated:
+            # Slurm array tasks must report failure so 'submit_full_run.bash retry' can resubmit them.
+            print(f"[ERROR] {n_extract_failed} series failed to extract (see [ERR] lines above).", file=sys.stderr)
+            return 4
 
     elif args.mode == "copy-sld":
         print(f"\nStaging {len(qualifying_sld_paths)} qualifying .sld file(s) to {args.output_dir}...")

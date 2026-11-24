@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 run_hybrid_segmentation.py
-Module 2: Stage 4 Two-Stage Hybrid AI Segmentation (ilastik + Cellpose/Omnipose)
+Module 2: Stage 4 Two-Stage Hybrid Segmentation (ilastik + seeded 3D watershed or Cellpose)
 
 Scientific & Algorithmic Sequence:
   1. Stage 4A (ilastik Semantic Denoising):
@@ -10,13 +10,17 @@ Scientific & Algorithmic Sequence:
        triggers OOM kills on shared SLURM compute nodes.
      - Produces a clean 32-bit foreground probability map (<movie_id>_Probabilities.tif)
        scoring each voxel from 0.0 (background/haze) to 1.0 (mitochondrion).
-  2. Stage 4B (Cellpose 3 / Omnipose Instance Splitting):
-     - Stacks normalized intensity and probability channels into (Z, 2, Y, X) per timepoint.
-     - Executes 2D flow prediction per slice and applies 2D-to-3D anisotropic IoU slice
-       stitching (stitch_threshold=0.35, anisotropy=6.25) across the 1.0 um Z-steps.
-     - If running on a CPU-only node without Cellpose, falls back to a 3D Seeded Marker
-       Watershed on the Euclidean Distance Transform so touching organelles in thin tubes
-       are still split deterministically.
+  2. Stage 4B (Instance Splitting: separating TOUCHING mitochondria):
+     - ilastik gives a foreground map; mitochondria packed end-to-end in a thin process form one
+       connected region, so instances must be split explicitly or counts/volumes/fission-fusion
+       calls are wrong.
+     - Default engine "watershed": seeded 3D watershed on distance-to-edge x intensity
+       (watershed_split_3d), seeds spaced in microns; CPU, seconds per frame.
+     - Option engine "cellpose": Cellpose 3 (industry standard; GPU used automatically when
+       available), 2D flows per slice + IoU Z-stitching, restricted to the ilastik foreground box.
+       Stock 'cyto3' is a whole-cell model and under-segmented mitochondria on practice data
+       (see README 2026-11-24); kept for fine-tuned models and the real-data comparison.
+     - Either way, instances with mean ilastik P below min_object_mean_probability are dropped.
   3. O(N) Vectorized Physical Volume Filtering & Relabeling:
      - Uses np.bincount and lookup table indexing (lut[masks_t]) to filter out noise
        fragments < 0.05 um^3 (MitoLandscape threshold) and relabel instances 1..N in a
@@ -29,7 +33,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional, Tuple
 
 # Bound OpenMP/BLAS threads to SLURM allocation
 _slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK", "4")
@@ -133,11 +137,16 @@ def run_stage4a_ilastik(
     return True
 
 
-def fallback_foreground_probability(mito_norm: np.ndarray) -> np.ndarray:
+def fallback_foreground_probability(mito_norm: np.ndarray, target_max: float = 50000.0) -> np.ndarray:
     """
     Computes a multi-scale difference-of-Gaussians + smoothed intensity foreground probability
     map [0.0, 1.0] per 2D slice when an external .ilp model is not yet present.
+
+    The DoG response is scaled against a FIXED fraction (25%) of Stage 3's normalized range, not
+    each slice's own percentile: a per-slice percentile always maps the brightest pixels of a
+    slice to P = 1, so slices containing only residual noise produced confident "mitochondria".
     """
+    scale = 0.25 * float(target_max)
     prob = np.zeros_like(mito_norm, dtype=np.float32)
     for t in range(mito_norm.shape[0]):
         for z in range(mito_norm.shape[1]):
@@ -147,43 +156,66 @@ def fallback_foreground_probability(mito_norm: np.ndarray) -> np.ndarray:
                 g1 = ndimage.gaussian_filter(sl, sigma=1.0)
                 g_bg = ndimage.gaussian_filter(sl, sigma=6.0)
                 dog = np.maximum(0.0, g1 - 0.5 * g_bg)
-                pos_vals = dog[dog > 0]
-                scale = float(np.percentile(pos_vals, 98.0)) if len(pos_vals) > 0 else 1.0
-                prob[t, z] = np.clip(dog / max(1e-5, scale), 0.0, 1.0)
+                prob[t, z] = np.clip(dog / scale, 0.0, 1.0)
     return prob
 
 
-def watershed_split_3d(binary_3d: np.ndarray, intensity_3d: np.ndarray, calib: Dict[str, float]) -> np.ndarray:
+def watershed_split_3d(
+    binary_3d: np.ndarray,
+    intensity_3d: np.ndarray,
+    calib: Dict[str, float],
+    seed_sep_xy_um: float = 0.4,
+    seed_sep_z_um: float = 1.0,
+    seed_prominence_um: float = 0.05,
+) -> np.ndarray:
     """
-    Splits touching 3D mitochondria along thin radial processes using local peak seeding on the
-    anisotropic Euclidean Distance Transform + intensity-weighted marker propagation.
+    Splits TOUCHING mitochondria inside a foreground mask with a seeded 3D watershed.
+
+    Why this matters: ilastik (Stage 4A) only says which voxels are mitochondria. Two mitochondria
+    lying end-to-end or side-by-side in a 1-2 um radial-glia process share one continuous
+    foreground region, so plain thresholding/connected components would count them as ONE object
+    and corrupt counts, volumes, and fission/fusion calls. The watershed separates them:
+      1. elevation = physical distance to the mask edge (um, anisotropic) weighted by smoothed
+         intensity -> one "hill" per organelle, highest at its bright core;
+      2. seeds = h-maxima: peaks that rise at least seed_prominence_um above the saddle that
+         separates them from a neighbour (a flat-topped organelle gives ONE seed, not several);
+         seeds closer than seed_sep_xy_um / seed_sep_z_um are merged (both in microns, so they
+         mean the same thing at any pixel size);
+      3. each region is flooded from its seed until it meets a neighbour; the meeting surface,
+         where foreground pinches or dims between organelles, becomes the boundary.
+    Any foreground component that received no seed keeps its own label (nothing is dropped).
     """
+    from skimage.morphology import h_maxima
+    from skimage.segmentation import watershed
+
+    binary_3d = np.asarray(binary_3d, dtype=bool)
     if not np.any(binary_3d):
-        return np.zeros_like(binary_3d, dtype=np.uint16)
+        return np.zeros(binary_3d.shape, dtype=np.int32)
+    dz, dy, dx = calib["dz_um"], calib["dy_um"], calib["dx_um"]
 
-    # Compute physical distance transform combined with normalized intensity
-    edt = ndimage.distance_transform_edt(
-        binary_3d, sampling=(calib["dz_um"], calib["dy_um"], calib["dx_um"])
-    )
-    combined_field = edt * (0.5 + 0.5 * (intensity_3d.astype(np.float32) / max(1.0, float(np.max(intensity_3d)))))
+    edt = ndimage.distance_transform_edt(binary_3d, sampling=(dz, dy, dx))
+    inten = ndimage.gaussian_filter(intensity_3d.astype(np.float32), sigma=(0.5, 1.0, 1.0))
+    inten_norm = inten / max(1e-6, float(inten[binary_3d].max()))
+    elevation = (edt * (0.5 + 0.5 * inten_norm)).astype(np.float32)
 
-    # Local maxima within a 3x5x5 window (~1.0 um Z x 0.8 um XY) act as organelle seeds
-    max_filt = ndimage.maximum_filter(combined_field, size=(1, 5, 5))
-    local_peaks = (combined_field == max_filt) & (combined_field > 0.08) & binary_3d
-    seed_labels, num_seeds = ndimage.label(local_peaks)
+    peaks = h_maxima(elevation, seed_prominence_um).astype(bool) & binary_3d
+    # Merge seeds closer than the minimum separation: dilating each by HALF the separation joins
+    # exactly those whose centres are within the full separation of each other.
+    rz = max(0, int(round(0.5 * seed_sep_z_um / dz)))
+    ry = max(1, int(round(0.5 * seed_sep_xy_um / dy)))
+    rx = max(1, int(round(0.5 * seed_sep_xy_um / dx)))
+    zz, yy, xx = np.ogrid[-rz : rz + 1, -ry : ry + 1, -rx : rx + 1]
+    footprint = (zz / max(rz, 0.5)) ** 2 + (yy / ry) ** 2 + (xx / rx) ** 2 <= 1.0
+    markers, _ = ndimage.label(ndimage.binary_dilation(peaks, structure=footprint) & binary_3d)
+    markers = markers.astype(np.int32)
+    labels = watershed(-elevation, markers, mask=binary_3d).astype(np.int32)
 
-    if num_seeds <= 1:
-        cc_labels, _ = ndimage.label(binary_3d)
-        return cc_labels.astype(np.uint16)
-
-    # Assign each foreground voxel to its nearest seed weighted by physical voxel dimensions
-    _, indices = ndimage.distance_transform_edt(
-        seed_labels == 0,
-        sampling=(calib["dz_um"], calib["dy_um"], calib["dx_um"]),
-        return_indices=True,
-    )
-    watershed_labels = seed_labels[tuple(indices)] * binary_3d
-    return watershed_labels.astype(np.uint16)
+    # Components without a seed (tiny or perfectly flat) keep their own label instead of vanishing
+    rest = binary_3d & (labels == 0)
+    if rest.any():
+        rest_lab, _ = ndimage.label(rest)
+        labels[rest] = rest_lab[rest] + int(labels.max())
+    return labels
 
 
 def filter_and_relabel_fast(masks_t: np.ndarray, min_voxels: int) -> Tuple[np.ndarray, int]:
@@ -210,18 +242,78 @@ def filter_and_relabel_fast(masks_t: np.ndarray, min_voxels: int) -> Tuple[np.nd
     return lut[masks_t], num_valid
 
 
-def segment_instances_cellpose(
+def gate_instances_by_probability(masks: np.ndarray, prob: np.ndarray, min_mean_p: float) -> np.ndarray:
+    """Zeroes every instance whose mean ilastik foreground probability is below min_mean_p."""
+    n = int(masks.max())
+    if n == 0:
+        return masks
+    mean_p = ndimage.mean(prob, labels=masks, index=np.arange(1, n + 1))
+    keep = np.concatenate([[False], np.nan_to_num(np.asarray(mean_p), nan=0.0) >= min_mean_p])
+    return np.where(keep[masks], masks, 0).astype(masks.dtype)
+
+
+def _watershed_frame_job(job: Tuple[Any, ...]) -> Tuple[np.ndarray, int]:
+    """
+    One frame of the watershed engine: split -> probability gate -> volume filter/relabel.
+    Runs on the frame's foreground bounding box only (all instances lie inside it, so gating and
+    relabelling the box give the same labels as doing it on the full frame). Top-level function so
+    a ProcessPoolExecutor can pickle it. Returns (relabelled uint16 box, instance count).
+    """
+    fg_box, inten_box, prob_box, calib, seed_xy, seed_z, seed_h, min_mean_p, min_voxels = job
+    masks_box = watershed_split_3d(
+        fg_box, inten_box, calib,
+        seed_sep_xy_um=seed_xy, seed_sep_z_um=seed_z, seed_prominence_um=seed_h,
+    )
+    masks_box = gate_instances_by_probability(masks_box, prob_box, min_mean_p)
+    return filter_and_relabel_fast(masks_box, min_voxels)
+
+
+def watershed_worker_count(n_jobs: int, n_workers: Optional[int] = None) -> int:
+    """
+    Worker processes for the per-frame watershed: n_workers if given, else $SLURM_CPUS_PER_TASK
+    (1 outside Slurm), never more than the number of frames with foreground.
+    """
+    if n_workers is None:
+        try:
+            n_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+        except ValueError:
+            n_workers = 1
+    return max(1, min(int(n_workers), n_jobs))
+
+
+def segment_instances(
     mito_norm: np.ndarray,
     prob_map: np.ndarray,
     cfg: Dict[str, Any],
     calib: Dict[str, float],
     fg_channel_idx: int = 0,
-) -> np.ndarray:
+    n_workers: Optional[int] = None,
+) -> Tuple[np.ndarray, str]:
     """
-    Executes Stage 4B instance segmentation (Cellpose 3 / Omnipose 2D+Z stitching, or
-    3D marker-seeded watershed fallback) followed by vectorized O(N) volume filtering.
+    Stage 4B instance segmentation: turns the ilastik foreground into individual mitochondria,
+    splitting TOUCHING organelles, then gates by probability and filters by physical volume.
+
+    engine (pipeline_config.yaml stage4b_instance_segmentation.engine):
+      "watershed" (default) - seeded 3D watershed on the probability foreground (watershed_split_3d);
+                              CPU, seconds per frame.
+      "cellpose"            - Cellpose 3 (industry-standard deep-learning segmenter), 2D per slice
+                              + Z-stitching; uses a GPU automatically when torch sees one. The
+                              stock 'cyto3' model is trained on whole cells, and on practice
+                              Series #39 it missed most mitochondria (18% foreground coverage vs
+                              100% for the watershed, 433 s vs 5 s per frame on CPU); a fine-tuned
+                              mitochondria model may change that (see manuals and README).
+    If Cellpose is requested but cannot be imported, the watershed is used and a warning printed.
+    Watershed frames are independent, so they run in parallel worker processes (n_workers, default
+    $SLURM_CPUS_PER_TASK; 1 = serial). Each frame is relabelled 1..N on its own, so the result is
+    identical to the serial loop. The Cellpose path is always serial (one model, maybe one GPU).
+    Returns (labels_4d, engine_used).
     """
     s_cfg = cfg.get("stage4_hybrid_segmentation", {}).get("stage4b_instance_segmentation", {})
+    engine = str(s_cfg.get("engine", "watershed")).strip().lower()
+    ws_cfg = s_cfg.get("watershed", {})
+    seed_xy = float(ws_cfg.get("seed_min_separation_xy_um", 0.4))
+    seed_z = float(ws_cfg.get("seed_min_separation_z_um", 1.0))
+    seed_h = float(ws_cfg.get("seed_min_prominence_um", 0.05))
     diameter = float(s_cfg.get("diameter_px", 8.0))
     flow_thresh = float(s_cfg.get("flow_threshold", 0.40))
     cellprob_thresh = float(s_cfg.get("cellprob_threshold", 0.0))
@@ -233,32 +325,89 @@ def segment_instances_cellpose(
     n_t, n_z, n_y, n_x = mito_norm.shape
     labels_4d = np.zeros((n_t, n_z, n_y, n_x), dtype=np.uint16)
 
-    try:
-        from cellpose import models
-        import torch
-        use_gpu = torch.cuda.is_available()
-        print(
-            f"[STAGE 4B] Initializing Cellpose model (type: {s_cfg.get('model_type', 'cyto3')}, GPU: {use_gpu})..."
-        )
-        model = models.CellposeModel(gpu=use_gpu, model_type=s_cfg.get("model_type", "cyto3"))
-        has_cellpose = True
-    except Exception as exc:
-        print(
-            f"[WARN] Cellpose not available ({exc}). Using 3D EDT marker-seeded watershed splitter.",
-            file=sys.stderr,
-        )
-        has_cellpose = False
+    has_cellpose = False
+    if engine in ("cellpose", "omnipose"):
+        try:
+            from cellpose import models
+            import torch
+            use_gpu = torch.cuda.is_available()
+            model_type = s_cfg.get("model_type", "cyto3")
+            print(f"[STAGE 4B] Engine: Cellpose (model: {model_type}, GPU: {use_gpu})...")
+            model = models.CellposeModel(gpu=use_gpu, model_type=model_type)
+            has_cellpose = True
+        except Exception as exc:
+            print(f"[WARN] Cellpose requested but unavailable ({exc}); using the 3D watershed.", file=sys.stderr)
+    elif engine != "watershed":
+        raise ValueError(f"Unknown stage4b engine '{engine}' (expected 'watershed' or 'cellpose')")
+    if not has_cellpose:
+        print(f"[STAGE 4B] Engine: seeded 3D watershed (seed spacing {seed_xy} um XY, {seed_z} um Z)...")
+    engine_used = "cellpose" if has_cellpose else "watershed"
+
+    fg_thresh = float(s_cfg.get("foreground_probability_threshold", 0.5))
+    min_mean_p = float(s_cfg.get("min_object_mean_probability", 0.5))
+    margin_px = int(round(2 * diameter))
+
+    if not has_cellpose:
+        # Watershed engine: build one job per frame with foreground (bounding box + margin, as below),
+        # then run them serially or in a process pool; results are written back in frame order.
+        jobs, boxes, frames = [], [], []
+        for t in range(n_t):
+            fg_t = prob_map[t] > fg_thresh
+            if not fg_t.any():
+                print(f"  [T={t+1}/{n_t}] No ilastik foreground (P > {fg_thresh}); 0 instances.")
+                continue
+            zs = np.flatnonzero(fg_t.any(axis=(1, 2)))
+            ys = np.flatnonzero(fg_t.any(axis=(0, 2)))
+            xs = np.flatnonzero(fg_t.any(axis=(0, 1)))
+            box = (
+                slice(max(0, int(zs[0]) - 1), min(n_z, int(zs[-1]) + 2)),
+                slice(max(0, int(ys[0]) - margin_px), min(n_y, int(ys[-1]) + 1 + margin_px)),
+                slice(max(0, int(xs[0]) - margin_px), min(n_x, int(xs[-1]) + 1 + margin_px)),
+            )
+            jobs.append((fg_t[box], mito_norm[t][box], prob_map[t][box], calib,
+                         seed_xy, seed_z, seed_h, min_mean_p, min_voxels))
+            boxes.append(box)
+            frames.append(t)
+        workers = watershed_worker_count(len(jobs), n_workers)
+        if workers > 1:
+            from concurrent.futures import ProcessPoolExecutor
+            print(f"[STAGE 4B] Watershed on {len(jobs)} frame(s) with {workers} parallel worker processes...")
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(_watershed_frame_job, jobs))  # map() keeps frame order
+        else:
+            results = [_watershed_frame_job(job) for job in jobs]
+        for t, box, (relabeled_box, count_t) in zip(frames, boxes, results):
+            labels_4d[t][box] = relabeled_box
+            print(f"  [T={t+1}/{n_t}] Segmented {count_t} mitochondrial instances (>= {min_vol_um3} um^3).")
+        return labels_4d, engine_used
 
     for t in range(n_t):
+        fg_t = prob_map[t] > fg_thresh
+        if not fg_t.any():
+            print(f"  [T={t+1}/{n_t}] No ilastik foreground (P > {fg_thresh}); 0 instances.")
+            continue
+        # Run Cellpose only on the Z-range / XY box that contains ilastik foreground (plus a margin):
+        # empty slices cost the same CPU time as full ones and only contribute noise objects.
+        zs = np.flatnonzero(fg_t.any(axis=(1, 2)))
+        ys = np.flatnonzero(fg_t.any(axis=(0, 2)))
+        xs = np.flatnonzero(fg_t.any(axis=(0, 1)))
+        box = (
+            # +-1 slice of Z context: helps Z-stitching and avoids single-slice inputs
+            slice(max(0, int(zs[0]) - 1), min(n_z, int(zs[-1]) + 2)),
+            slice(max(0, int(ys[0]) - margin_px), min(n_y, int(ys[-1]) + 1 + margin_px)),
+            slice(max(0, int(xs[0]) - margin_px), min(n_x, int(xs[-1]) + 1 + margin_px)),
+        )
+        masks_t = np.zeros((n_z, n_y, n_x), dtype=np.int32)
+
         if has_cellpose:
-            norm_ch0 = mito_norm[t].astype(np.float32) / 50000.0
-            norm_ch1 = prob_map[t].copy()
+            norm_ch0 = mito_norm[t][box].astype(np.float32) / 50000.0
+            norm_ch1 = prob_map[t][box].copy()
             norm_ch1[norm_ch1 < 0.25] = 0.0
             img_t = np.stack([norm_ch0, norm_ch1], axis=1)  # (Z, C=2, Y, X)
 
             # Cellpose 3.x API: 'do_3D' (capital D). z_axis/channel_axis are explicit so Cellpose
             # never guesses which of the (Z, C, Y, X) axes holds the two input channels.
-            masks_t, _, _ = model.eval(
+            masks_box, _, _ = model.eval(
                 img_t,
                 diameter=diameter,
                 channels=[1, 2],
@@ -270,16 +419,33 @@ def segment_instances_cellpose(
                 stitch_threshold=stitch_thresh,
                 min_size=min_voxels,
             )
+            masks_t[box] = np.asarray(masks_box).reshape(masks_t[box].shape)
         else:
-            bin_t = prob_map[t] >= 0.55
-            masks_t = watershed_split_3d(bin_t, mito_norm[t], calib)
+            masks_t[box] = watershed_split_3d(
+                fg_t[box], mito_norm[t][box], calib,
+                seed_sep_xy_um=seed_xy, seed_sep_z_um=seed_z, seed_prominence_um=seed_h,
+            )
+
+        # Keep only instances that ilastik agrees are mitochondria (mean P >= min_mean_p).
+        masks_t = gate_instances_by_probability(masks_t, prob_map[t], min_mean_p)
 
         # Vectorized O(N) volume filter and sequential relabeling
         relabeled_t, count_t = filter_and_relabel_fast(masks_t, min_voxels)
         labels_4d[t] = relabeled_t
         print(f"  [T={t+1}/{n_t}] Segmented {count_t} mitochondrial instances (>= {min_vol_um3} um^3).")
 
-    return labels_4d
+    return labels_4d, engine_used
+
+
+def segment_instances_cellpose(
+    mito_norm: np.ndarray,
+    prob_map: np.ndarray,
+    cfg: Dict[str, Any],
+    calib: Dict[str, float],
+    fg_channel_idx: int = 0,
+) -> np.ndarray:
+    """Backward-compatible wrapper: runs segment_instances with the configured engine, returns labels only."""
+    return segment_instances(mito_norm, prob_map, cfg, calib, fg_channel_idx)[0]
 
 
 def main() -> int:
@@ -320,12 +486,20 @@ def main() -> int:
     project_file = models_dir / ilastik_cfg.get("project_file", "bestman_mito_2d_v1.ilp")
     fg_idx = int(ilastik_cfg.get("foreground_class_index", 0))
     n_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", "4"))
+    # ilastik's cache must stay inside the job's cgroup: default to 60% of --mem (SLURM_MEM_PER_NODE
+    # is in MB), leaving the rest for this process's copies of mito_norm and the probability map.
+    ram_mb = int(
+        os.environ.get("MITO_ILASTIK_RAM_MB")
+        or max(2000, int(int(os.environ.get("SLURM_MEM_PER_NODE", "8192")) * 0.6))
+    )
 
     allow_fallback = os.environ.get("MITO_ALLOW_ILASTIK_FALLBACK", "0") == "1"
     raw_npy_path = args.work_dir / f"{args.movie_id}_ilastik_tzyxc.npy"
     prob_map = None
     if is_valid_ilastik_project(project_file):
-        if run_stage4a_ilastik(mito_norm_path, raw_npy_path, ilastik_bin, project_file, num_threads=n_threads):
+        if run_stage4a_ilastik(
+            mito_norm_path, raw_npy_path, ilastik_bin, project_file, num_threads=n_threads, ram_mb=ram_mb
+        ):
             try:
                 prob_map = load_ilastik_probabilities(raw_npy_path, fg_idx, mito_norm.shape)
             except ValueError as exc:
@@ -348,10 +522,13 @@ def main() -> int:
 
     stage4a_source = "ilastik" if prob_map is not None else "fallback_estimator"
     if prob_map is None:
-        prob_map = fallback_foreground_probability(mito_norm)
+        target_max = float(
+            cfg.get("stage3_preprocessing", {}).get("intensity_normalization", {}).get("target_max_uint16", 50000)
+        )
+        prob_map = fallback_foreground_probability(mito_norm, target_max)
     write_tiff(prob_out_path, prob_map.astype(np.float32), metadata=calib)
 
-    labels_4d = segment_instances_cellpose(mito_norm, prob_map, cfg, calib, fg_channel_idx=fg_idx)
+    labels_4d, engine_used = segment_instances(mito_norm, prob_map, cfg, calib, fg_channel_idx=fg_idx)
 
     labels_out_path = args.work_dir / f"{args.movie_id}_mito_labels.tif"
     print(f"[{args.movie_id}] Exporting 4D instance labels: {labels_out_path.name}")
@@ -361,13 +538,14 @@ def main() -> int:
     prov["stage4_segmentation_metrics"] = {
         "ilastik_model": str(project_file.name),
         "stage4a_probability_source": stage4a_source,
-        "instance_engine": cfg.get("stage4_hybrid_segmentation", {})
-        .get("stage4b_instance_segmentation", {})
-        .get("engine", "cellpose"),
-        "instance_model": cfg.get("stage4_hybrid_segmentation", {})
-        .get("stage4b_instance_segmentation", {})
-        .get("model_type", "cyto3"),
-        "min_volume_filter_um3": 0.05,
+        "instance_engine": engine_used,
+        "instance_model": (
+            cfg.get("stage4_hybrid_segmentation", {}).get("stage4b_instance_segmentation", {}).get("model_type", "cyto3")
+            if engine_used == "cellpose" else "seeded_3d_watershed"
+        ),
+        "min_volume_filter_um3": float(
+            cfg.get("stage4_hybrid_segmentation", {}).get("stage4b_instance_segmentation", {}).get("min_volume_um3", 0.05)
+        ),
         "mean_instances_per_frame": round(float(np.mean(inst_counts)), 1),
         "total_instances_across_time": int(np.sum(inst_counts)),
     }

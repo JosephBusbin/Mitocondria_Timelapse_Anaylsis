@@ -254,8 +254,13 @@ OK (skipped=12)
 | **Alternative Compression** | `--compression Deflate` | Deflate (gzip) compression instead of standard LZW. |
 | **Re-extract / Overwrite** | `--overwrite` | Forces re-extraction of previously extracted files. *(By default, existing files are safely skipped in seconds).* |
 | **Copy Raw Files Instead** | `--mode copy-sld` | Stages the raw `.sld` container and companion folders instead of converting to TIFF. |
+| **Mito movies only** | `--plasmid-csv "D:\path\Plasmid_Primer_List_Bestman_Lab.csv"` | Classifies every `.sld` by file name **before** Bio-Formats opens it. Only files labelled `MITO` are inspected and extracted; the rest get health status `SKIPPED_NOT_MITO`. Writes `mito_classification.csv` + `mito_review.csv`. See `manuals/construct_filter_guide.md`. |
+| **Classify but keep everything** | `--plasmid-csv ... --mito-filter report` | Adds `mito_label`, `mito_fp`, `mito_color`, `red_mito_flag` columns to the inventory without skipping anything. |
+| **Apply your review decisions** | `--mito-overrides "D:\path\mito_overrides.csv"` | CSV `pattern,label,note`; the first matching pattern wins over the heuristics on every future scan. |
 
 ---
+
+> **Recommended first pass on a new archive**: run `--mode scan-only --plasmid-csv ...` and open `mito_review.csv`. Write overrides for the `REVIEW` files (high-priority rows first), then extract. Movies flagged `red_mito_flag = TRUE` carry the mito label in the red channel; set `channel_mito`/`channel_cell` accordingly in `pipeline_config.yaml` before running them.
 
 ## Step 9: Understanding & Troubleshooting Lab Archive Warnings
 

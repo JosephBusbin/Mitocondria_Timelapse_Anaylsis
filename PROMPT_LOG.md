@@ -467,3 +467,183 @@ This file serves as persistent local memory for AI agents operating in this repo
   - Verify the sha256 and the `HDF` signature; then run `sbatch --stages 4` (or 3–5) on the pilot movie. That is the first real headless test of the numpy export flags.
   - The calibration/grouping filter task is upcoming; the plasmid CSV task is still pending.
   - Phase B onward is still uncommitted.
+
+---
+
+## Session 2026-11-23/24 — First full Stage 3→5 run with the trained .ilp; per-stage QC (Claude Opus 5.5)
+- **User Request**:
+  - (11-23) The `.ilp` was uploaded (97 869 224 B, sha256 3f71227d…d53b). "Let's get a fuller run going."
+  - (11-24) Check the jobs, address errors, rerun stages individually if needed, then together, checking each stage works as intended.
+- **Actions (11-23)**:
+  - Verified the `.ilp`: size and sha256 match, HDF signature present.
+  - `run_hybrid_segmentation.py`: ilastik `--ram` was a hard-coded 24000 MB inside an 8 GB job. It is now 60% of `SLURM_MEM_PER_NODE`, overridable with `MITO_ILASTIK_RAM_MB`.
+  - Job 703461 (`sbatch -c 8 --mem=32G -t 3:00:00 --stages 3,4,5 --keep-intermediates`): COMPLETED in 1:55:46, MaxRSS 14.1 GB.
+    - Stage 4A (ilastik) took about 3 min.
+    - Cellpose took 11–17 min per frame: cyto3 at `diameter_px=8` upsamples slices about 3.75×.
+  - Job 703462: a Stage-5-only hedge (`--dependency=afterany`), COMPLETED in 1 min.
+- **QC (11-24)**:
+  - New tool `scripts/qc_pipeline_outputs.py` (per-stage report). Ad-hoc diagnostics are in `/sciclone/scr30/jbusbin/mito_jobs/{diag_stage4,diag_ilp,render_qc,render_raw,signal_check}.py`, PNGs in `/sciclone/scr30/jbusbin/mito_qc_png/`, reports in `mito_logs/qc_pilot_run1.txt` and `diag_stage4.txt`.
+  - `.ilp` is OK: labels [Mitochondria, Background], ClassifierForests stored, ComputeIn2d all True, data ProjectInternal. Only 137 mito and 116 background voxels were labelled.
+  - **Root finding: raw ch1 (mito) of Series #20 has NO signal.** T-averaged in-cell minus background ring = −0.13 counts (noise SD 2.8); full-FOV ch1 p50 102 vs max 123. Ch2 (cell fill) has +5.9 counts.
+    - The `.sld` series names (`photactivate`, `2x5ms-5%`) suggest a photoactivation experiment, so ch1 may be a dark PA reporter. **Unconfirmed; the user should ask the lab.**
+    - This movie cannot validate Stages 4–5.
+  - **Stage 3 bug**: the dilated-mask gate is applied BEFORE the white top-hat. Regions narrower than the 31 px kernel keep their full intensity: the process saturates and a ring of artifacts forms at the mask edge. Fix: top-hat first, then gate (verified on frame 0 in `raw_vs_norm_t0.png`).
+  - **Stage 3 QC flaw**: SNR is measured after top-hat and normalization, so pure noise reported `QC: PASS`. It needs a raw in-cell vs background contrast gate.
+  - Stage 4A: P is about an intensity threshold (corr with mito_norm 0.97; P>0.5 only on voxels near the 50 000 cap). Per-frame fractions are identical because the frames are nearly identical (120 s, static).
+  - Stage 4B: Cellpose ignores ilastik (mean P in labels about 0.05; covers about 0.1% of P>0.5 voxels); it segments amplified noise; 85–95% of objects are single-slice.
+  - **Stage 5B bug**: barycenters outside the exact cell mask (comp_id 0) are relabelled `basal_process` with geodesic 0 (all 3 259 "basal" spots). The soma geodesic is negative (skfmm signed distance inside the soma).
+  - Stage 5A design weakness: any unmatched start or end within 2 µm becomes a fission or fusion, with no birth/death alternative and no intensity conservation. That gives 470 "fissions" in frame 0 and 254 "fusions" in frame 8.
+- **Handoff / Next Steps** (awaiting user approval of the plan; >3 files):
+  - Fix the Stage 3 order and add the raw-contrast QC gate.
+  - Fix Stage 5B outside-mask handling and soma clamp.
+  - Gate Cellpose by ilastik foreground (also skips empty slices, which speeds it up).
+  - Add a tracker split/merge intensity/volume check.
+  - Update the ilastik labelling guidance.
+  - Obtain a 4D two-channel movie with real mls-EGFP signal for validation.
+
+---
+
+## Session 2026-11-24 (cont.) — Fixes implemented, stage-by-stage re-validation; mito construct filter planned (Claude Opus 5.5)
+- **User decisions**:
+  - Implement "everything incl. tracker".
+  - Test on Series #39/#18; fall back to synthetic data only if they fail.
+  - Mito-construct filter plan approved:
+    - photoactivatable constructs go in a separate excluded bin;
+    - unclear files go to REVIEW with an overrides CSV;
+    - the mito colour is reported and red-mito movies are flagged;
+    - common unrecorded mito markers go to REVIEW at high priority;
+    - add a synthetic-directory test;
+    - keep the manual.
+- **Code changes (uncommitted)**:
+  - `preprocess_4d_stack.py`:
+    - New `measure_raw_mito_contrast` (QC on the unprocessed channel; `FAIL_NO_SIGNAL` exits with code 3).
+    - New `remove_haze_then_gate_inplace`: top-hat BEFORE gating.
+    - Drift: `_structure_only` + `_register_series_2d`, background-subtracted phase correlation. `max_shift_*` is now a per-frame step limit, with a chained fallback.
+    - Cell mask: broad-background subtraction before Triangle (`background_sigma_xy_um` 5, `background_sigma_z_um` 3).
+  - `run_pipeline_slurm.bash`: exit 3 stops before Stage 4 (`MITO_IGNORE_QC=1` overrides).
+  - `run_hybrid_segmentation.py`:
+    - Cellpose runs only on the ilastik foreground Z/XY box (±1 Z), and objects are gated by mean P (`gate_instances_by_probability`).
+    - Fallback estimator uses a fixed scale (25% of `target_max`) instead of a per-slice percentile.
+  - `run_trackmate_sparse_lap.py`:
+    - Split/merge require parent/(d1+d2) signal within [1/1.5, 1.5] (`split_merge_max_intensity_ratio`), accepted greedily by cost.
+    - CSVs are always written (header-only when empty).
+  - `run_arbor_and_mitolandscape.py`:
+    - Outside-mask barycenters are snapped within 1.5 µm, else `outside_cell` with NaN distance (previously silently `basal_process`, 0).
+    - Soma distance clamped to ≥ 0.
+    - Transport state `OUTSIDE_CELL`.
+  - `pipeline_config.yaml`: new keys for each of the above.
+  - Tests:
+    - New 03b, 03c, 05c, 06b, 07b.
+    - test_06 made signal-conserving.
+    - test_08 rebuilt with a realistic noisy movie (2 rods), asserting exactly 2 objects per frame, no fission/fusion, and 0.48 µm/frame displacement.
+    - **31/31 pass on bora.**
+  - ilastik manual: Step 1.0 (train only on QC-PASS movies), Rules A2 and A3 (dim mitochondria, in-cell background).
+- **Validation runs**:
+  - Extracted the low-T series (job 703573) to `/sciclone/data10/jbusbin/mito_pipeline/raw_ometiff_lowT/`. Signal: S18 ch1 4.2 σ (T=2), S20 0.8 σ, S39 1.5 σ full-field, but the cell-local Stage 3 measure gives **35.8 σ**.
+  - Plasmid table: `obf01` = OBF001, mito-**paGFP** (photoactivatable). This explains the empty ch1 in S20.
+  - Stage 3 (jobs 703582/703588/703593):
+    - S20 → `FAIL_NO_SIGNAL` (0.94 σ), stopped before Stage 4.
+    - S39 → `QC_WARNING` only because drift of 16.05 µm exceeds 15 µm. Drift was 79 px; the old estimator returned ≤ 5 px (r 0.15 → 0.92 after the fix).
+    - The new mask excludes a neighbouring soma (S20) and the out-of-focus halo (S39).
+    - PNGs in `/sciclone/scr30/jbusbin/mito_qc_png/`.
+  - Stage 4 on S39 (job 703597, built-in estimator via an empty `MITO_MODELS_DIR`; the user's `.ilp` is untouched but was trained on noise): 7–15 objects per frame, 41 min.
+    - QC: Cellpose covers only 9–23% of P>0.5 foreground and misses the puncta along the process.
+    - Comparison job 703625 is running: 3D watershed vs Cellpose d=8 / d=15 / cellprob −2.
+- **Parallel**: a subagent is building `scripts/construct_classifier.py`, `config/construct_lexicon.json`, `scripts/test_construct_classifier.py` and `manuals/construct_filter_guide.md` (new files only). Collector integration follows in the main session.
+- **Handoff**:
+  - Choose the Stage 4B method from job 703625.
+  - Then run Stage 5 on S39.
+  - Then a combined 3→5 run.
+  - The user retrains ilastik on S39 `mito_norm` (QC PASS).
+  - Integrate the classifier into the collector.
+- **Update (same session)**: the mito-construct classifier subagent finished.
+  - It created only its 4 files; 37/37 tests pass, re-run by the main session.
+  - Real names: S-practice → `MITO_PHOTOACTIVATABLE`; `max_d318…jr19…` → MITO (EGFP); `MAXmlsEGFP…` → MITO (mls); `mf02` test → MITO, red flag.
+  - The synthetic tree (seed 42, 66 files) had 0 mismatches.
+  - Collector integration done:
+    - `SeriesMetadata` gets mito_* columns.
+    - Flags `--plasmid-csv` / `--mito-filter` / `--mito-overrides` / `--construct-lexicon`.
+    - `SKIPPED_NOT_MITO` health status.
+    - `mito_classification.csv` / `mito_review.csv` and a provenance block.
+  - Test 01o passes on dev. A real-folder scan-only run (require mode) skipped the practice `.sld` as `MITO_PHOTOACTIVATABLE` without calling Bio-Formats.
+  - Windows guide: Advanced Options rows plus a "first pass" note.
+  - **Subagent judgement calls for the user to confirm**:
+    1. Reporters containing "mito" (mito-GCaMP, mitoTimer, MitoTracker, mito-dsred) go to REVIEW high, not MITO.
+    2. `cox8a` is a direct keyword.
+    3. Bare `mt` is a common marker (it may mean "mutant").
+    4. A non-`mls` keyword with no FP plus only non-mito plasmids → REVIEW.
+    5. Sensors (CEPIA, cpYFP) → MITO.
+    6. `red_mito_flag` is set for red only, not far-red.
+    7. The single-letter `p` prefix is ignored for unknown-ID detection (`p2a`).
+    8. Rows with blank localization but a mito name count as mito.
+    9. `.sldy` and `.ome.tiff` were added to the scanned extensions.
+
+---
+
+## Session 2026-11-24 (cont.) — Watershed default, future validation task, GPU env on hima (Claude Opus 5.5)
+- **User decisions / requests**:
+  - Watershed is the default for now, but keep Cellpose **prominent** (the user has GPU access and wants the industry standard).
+  - Write a future task for a **representative randomized sample** of the real archive, including a watershed vs Cellpose comparison section. Cellpose may be removed if it fails there.
+  - Make the **touching-objects** distinction explicit in the plan, manuals and README.
+  - Show the endfoot overlay.
+  - Use **hima** for GPU jobs and compare run times.
+  - Keep progressively testing.
+  - Filtering subtask: summary given; the user will confirm the 9 judgement calls later.
+- **Code**:
+  - `run_hybrid_segmentation.py`:
+    - `segment_instances()` engine dispatch; `watershed_split_3d()` rewritten as a real skimage watershed (h-maxima seeds on EDT × intensity, seed spacing/prominence in µm, unseeded components kept).
+    - Cellpose uses a GPU automatically; provenance records `instance_engine`.
+  - Config:
+    - `engine: watershed`, `watershed:` block (0.4 / 1.0 / 0.05 µm);
+    - `min_volume_um3` 0.10;
+    - unused `anisotropy` removed.
+  - Test 05d (touching pair → 2, rod → 1, touching puncta → 2, unknown engine raises); **33/33 pass**.
+  - New `scripts/setup_gpu_env.bash`:
+    - separate `envs/mito4d_gpu_env` pinned to the CPU env's `env_freeze.txt`, CUDA torch chosen by an arch + kernel test;
+    - result: **torch 2.14.1+cu126** (sm_50–sm_90; cu130 and cu128 start at sm_75, so no P100/V100);
+    - Cellpose GPU check on a P100 passed;
+    - `activate_mito4d_gpu.sh`, `gpu_install_manifest.txt`, `gpu_env_freeze.txt`.
+  - **Incident**:
+    - hima nodes have no `/local`; the cache fallback went to `/tmp` (10 GB) and filled it on hi04.
+    - With user approval, I deleted `/tmp/jbusbin_local` on hi04 (now 2% used).
+    - Both setup scripts and the activation helper now fall back to `/sciclone/scr30/$USER/node_cache`, never `/tmp`.
+- **Docs**:
+  - New `manuals/future_task_representative_sample_validation.md`:
+    - stratified random sample;
+    - per-stage checks, including late-frame noise amplification;
+    - 4B comparison on hand-annotated touching mitochondria, with merge/split errors and AP50;
+    - decision rule.
+  - Status notes in `mitochondria_hpc_pipeline_plan.md` (Phase 4 + Checkpoint 4), `pipeline_agent_spec.md` and `manuals/ilastik_training_protocol.md`; README entry.
+- **Runs**:
+  - S18 Stage 3: `FAIL_NO_SIGNAL` (2.64 σ).
+  - S39 Stages 4+5 (watershed, built-in estimator): 24–48 objects/frame, but 145 at t=5. Specks across the soma, probably bleach histogram matching amplifying noise plus the built-in estimator; logged as a future check.
+    - Tracking: 26 tracks, 5 fissions, 0 fusions, median link 0.85 µm/frame.
+    - 5B: no negatives / outside-cell.
+  - **Full S39 3→5 run (job 703660): 3 min 10 s, 3.5 GB peak**, identical results (deterministic).
+  - Endfoot overlay (37 objects at t=0): `/sciclone/scr30/jbusbin/mito_qc_png/endfoot_ws_S39_t0.png`.
+  - Running: S18 watershed vs Cellpose (703654); timing on CPU / P100 / V100 (703678/703679/703680).
+- **Handoff**:
+  - Report the timing table.
+  - The user retrains ilastik on S39.
+  - Slurm default resources can likely drop (Stage 3–5 fits 4 CPU / 8–16 GB / <10 min with the watershed); confirm after more movies.
+  - The filtering judgement calls await the user.
+- **Update (same session, later)**:
+  - **Stage 4B timing** (#39 frames 0 and 5; jobs 703678/703679/703680):
+    - watershed 7–10 s/frame on every device;
+    - Cellpose `cyto3` d=8: CPU (8 cores) 421–575 s, P100 42–45 s, V100 36 s (~11–14× speed-up);
+    - d=15: CPU 158–206 s, P100 15–20 s, V100 12–16 s.
+    - Quality is identical across devices (coverage d=8 9–18%, d=15 1.5–19%, spill ~45%).
+  - **#18 comparison** (job 703654, 61 min; QC-FAIL movie, built-in estimator, so the foreground is mostly noise and the numbers are only indicative):
+    - watershed: ~2,400 objects/frame, 100% coverage, objects span a median of 4 slices, 27 s/frame;
+    - Cellpose d=8: 64–73% coverage, 30% spill, 65–73% single-slice, 1,307–1,384 s/frame;
+    - d=15: 19–46% coverage.
+  - **Throughput planning approved:**
+    - 20% bora cap; overflow only when bora is full, to non-preemptable allowlisted clusters (kuro, astral), never VIMS;
+    - extraction on SciClone; "canary" pilot batch.
+    - Name pre-filter on the lab PC before the Globus transfer; Globus Connect Personal can share the backup drive directly.
+    - Estimates: transfer ~15–20 h for 6 TB (the bottleneck); extraction ~3 h per TB of 4D data at 20 streams; Stage 3 ~15–30 min; Stages 4–5 ~2–4 h for 600 movies.
+    - Measured: Stages 3–5 are single-threaded (CPU time = wall time), so they get 1 core; ilastik gets 4; bora `/local` is the 10 GB root fs, so it can't be used as scratch.
+  - A **subagent** is building the orchestration (plan file: `/sciclone/home/jbusbin/.claude/plans/okay-great-these-scripts-witty-salamander-of-c452e753-47a3-4f13-bdd2-823807ce1620.md`). It owns:
+    - edits: `run_pipeline_slurm.bash`, `run_hybrid_segmentation.py`, `collect_4d_sld_timelapses.py`, `pipeline_config.yaml` (`hpc_run:`), and a new test class;
+    - new files: `merge_collect_shards.py`, `plan_full_run.py`, `submit_full_run.bash`, `aggregate_results.py`, `manuals/full_run_playbook.md`.
+    - The main session will not edit those files until it returns, then runs a dress rehearsal on S18/S20/S39.

@@ -30,6 +30,9 @@ Scientific & Algorithmic Sequence:
      - Applies OpenCV C++-accelerated morphological white top-hat filtering (cv2.MORPH_TOPHAT)
        with an elliptical structuring element (radius = 15 px, ~2.4 um) to strip diffuse
        cytoplasmic GFP haze (~15x faster than scipy.ndimage.white_tophat).
+     - Runs on the UNGATED crop, before step 4's gating (see remove_haze_then_gate_inplace).
+  6b. Raw-signal QC: measure_raw_mito_contrast() checks the unprocessed mito channel stands
+     above background noise; FAIL_NO_SIGNAL exits with code 3 so the Slurm job stops before Stage 4.
   7. Cross-Day Percentile Intensity Normalization:
      - Linearly rescales non-zero foreground intensities from [P_1.0, P_99.9] into a standardized
        16-bit dynamic range [0, 50000] so a single trained ilastik/Cellpose model generalizes
@@ -62,6 +65,9 @@ except ImportError:
     from .pipeline_config_io import load_config as _load_pipeline_config
 
 
+EXIT_QC_FAIL = 3  # run_pipeline_slurm.bash stops before Stage 4 on this code (override: MITO_IGNORE_QC=1)
+
+
 def load_config(config_path: Path) -> Dict[str, Any]:
     """Loads pipeline_config.yaml, expanding ${MITO_*} storage placeholders (see pipeline_config_io)."""
     return _load_pipeline_config(config_path)
@@ -89,6 +95,37 @@ def parse_metadata(meta_dict: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[
     return calib
 
 
+def _structure_only(img: np.ndarray, smooth_sigma, bg_sigma) -> np.ndarray:
+    """Light smoothing minus a broad background: keeps cell structure, drops offset/fixed pattern."""
+    img = img.astype(np.float32)
+    return np.maximum(ndimage.gaussian_filter(img, smooth_sigma) - ndimage.gaussian_filter(img, bg_sigma), 0.0)
+
+
+def _register_series_2d(frames, window, max_step: float):
+    """
+    Corrective (x, y) shifts aligning each 2D frame to frame 0 by phase correlation.
+    max_step bounds the change in drift between CONSECUTIVE frames (not the total drift, which can
+    exceed it many times over in long movies). When the direct frame-0 estimate implies a larger
+    step (a likely false lock), the frame-to-frame chained estimate is used for that frame.
+    """
+    n = len(frames)
+    sx = np.zeros(n, dtype=np.float32)
+    sy = np.zeros(n, dtype=np.float32)
+    for t in range(1, n):
+        # cv2.phaseCorrelate(a, b) returns the displacement from a to b; negate it to register b onto a.
+        (dx0, dy0), _ = cv2.phaseCorrelate(frames[0], frames[t], window=window)
+        (dx1, dy1), _ = cv2.phaseCorrelate(frames[t - 1], frames[t], window=window)
+        direct = (-dx0, -dy0)
+        chained = (sx[t - 1] - dx1, sy[t - 1] - dy1)
+        if max(abs(direct[0] - sx[t - 1]), abs(direct[1] - sy[t - 1])) <= max_step:
+            sx[t], sy[t] = direct
+        else:
+            step_x = float(np.clip(chained[0] - sx[t - 1], -max_step, max_step))
+            step_y = float(np.clip(chained[1] - sy[t - 1], -max_step, max_step))
+            sx[t], sy[t] = sx[t - 1] + step_x, sy[t - 1] + step_y
+    return sx, sy
+
+
 def estimate_fast4dreg_drift(
     ch_cell: np.ndarray,
     max_shift_xy: int = 25,
@@ -105,8 +142,8 @@ def estimate_fast4dreg_drift(
 
     Parameters:
       ch_cell      : 4D array of shape (T, Z, Y, X) representing the cytosolic reference channel.
-      max_shift_xy : Maximum allowed lateral shift in pixels per timepoint.
-      max_shift_z  : Maximum allowed axial shift in slices per timepoint.
+      max_shift_xy : Maximum lateral drift CHANGE between consecutive frames (pixels).
+      max_shift_z  : Maximum axial drift CHANGE between consecutive frames (slices).
 
     Returns:
       Tuple of 1D float32 arrays (shifts_x, shifts_y, shifts_z) representing the corrective
@@ -117,26 +154,27 @@ def estimate_fast4dreg_drift(
     shifts_y = np.zeros(n_t, dtype=np.float32)
     shifts_z = np.zeros(n_t, dtype=np.float32)
 
-    # Step 1: Lateral (X, Y) drift estimation using 2D Hanning window to suppress edge artifacts
-    ref_xy = np.max(ch_cell[0], axis=0).astype(np.float32)
+    # Step 1: Lateral (X, Y) drift on background-subtracted Z max-projections.
+    # Raw projections sit on a ~100-count camera offset with fixed-pattern noise; phase correlation
+    # whitens the spectrum, so that static pattern produces a dominant zero-shift peak and real
+    # drift is missed (practice Series #39: raw r = 0.15 vs 0.92 after background subtraction).
+    mips_xy = [_structure_only(np.max(ch_cell[t], axis=0), (2.0, 2.0), (25.0, 25.0)) for t in range(n_t)]
     hann_xy = cv2.createHanningWindow((n_x, n_y), cv2.CV_32F)
+    sx, sy = _register_series_2d(mips_xy, hann_xy, max_shift_xy)
+    shifts_x[:], shifts_y[:] = sx, sy
 
-    for t in range(1, n_t):
-        mov_xy = np.max(ch_cell[t], axis=0).astype(np.float32)
-        # cv2.phaseCorrelate(src1, src2) returns the shift (dx, dy) from src1 to src2.
-        # To register mov_xy back onto ref_xy, we negate the detected displacement.
-        (dx, dy), _ = cv2.phaseCorrelate(ref_xy, mov_xy, window=hann_xy)
-        shifts_x[t] = float(np.clip(-dx, -max_shift_xy, max_shift_xy))
-        shifts_y[t] = float(np.clip(-dy, -max_shift_xy, max_shift_xy))
-
-    # Step 2: Axial (Z) drift estimation on (Z, X) max-intensity projections
-    ref_zx = np.max(ch_cell[0], axis=1).astype(np.float32)  # Shape: (Z, X)
-    for t in range(1, n_t):
-        # Shift the 2D (Z, X) projection laterally along X first (avoiding a 3D volume shift)
-        mov_zx_raw = np.max(ch_cell[t], axis=1).astype(np.float32)
-        mov_zx = ndimage.shift(mov_zx_raw, shift=(0.0, shifts_x[t]), order=1, mode="nearest")
-        (_, dz), _ = cv2.phaseCorrelate(ref_zx, mov_zx)
-        shifts_z[t] = float(np.clip(-dz, -max_shift_z, max_shift_z))
+    # Step 2: Axial (Z) drift on background-subtracted (Z, X) max-projections, after removing the
+    # lateral X shift (avoids a 3D volume shift).
+    mips_zx = []
+    for t in range(n_t):
+        zx = np.max(ch_cell[t], axis=1).astype(np.float32)
+        if t > 0:
+            zx = ndimage.shift(zx, shift=(0.0, float(shifts_x[t])), order=1, mode="nearest")
+        # filter along X only: Z stacks are short, and smoothing along Z would blur the axial signal
+        mips_zx.append(_structure_only(zx, (0.0, 2.0), (0.0, 25.0)))
+    hann_zx = cv2.createHanningWindow((n_x, n_z), cv2.CV_32F)
+    _, sz = _register_series_2d(mips_zx, hann_zx, max_shift_z)
+    shifts_z[:] = sz
 
     return shifts_x, shifts_y, shifts_z
 
@@ -165,6 +203,8 @@ def compute_cell_mask_and_crop(
     dz_um: float,
     pad_xy_um: float = 5.0,
     pad_z_um: float = 2.0,
+    bg_sigma_xy_um: float = 5.0,
+    bg_sigma_z_um: float = 3.0,
 ) -> Tuple[np.ndarray, Tuple[int, int, int, int, int, int]]:
     """
     Computes an exact 3D binary cell mask from the time-averaged cytosolic channel and
@@ -173,6 +213,14 @@ def compute_cell_mask_and_crop(
     # Time-average suppresses transient noise and highlights the stationary radial glial arbor
     time_avg = np.mean(ch_cell_reg, axis=0)  # Shape: (Z, Y, X)
     smoothed = ndimage.gaussian_filter(time_avg, sigma=(1.0, 2.0, 2.0))
+    # Subtract the broad out-of-focus glow before thresholding. Without this, Triangle on the raw
+    # average lands just above background: the mask swallowed the soma's halo (practice #39) and
+    # merged a NEIGHBORING cell's soma into the target cell (practice #20).
+    if bg_sigma_xy_um > 0:
+        broad = ndimage.gaussian_filter(
+            time_avg, sigma=(bg_sigma_z_um / dz_um, bg_sigma_xy_um / dy_um, bg_sigma_xy_um / dx_um)
+        )
+        smoothed = np.maximum(smoothed - broad, 0.0)
 
     # Rescale to 8-bit solely for Triangle threshold estimation (captures dim radial processes)
     s_min, s_max = float(np.min(smoothed)), float(np.max(smoothed))
@@ -265,6 +313,56 @@ def compensate_z_attenuation_inplace(vol_4d: np.ndarray, trigger_drop_ratio: flo
     return True
 
 
+def measure_raw_mito_contrast(
+    ch_mito: np.ndarray,
+    cell_mask: np.ndarray,
+    calib: Dict[str, float],
+    ring_um: Tuple[float, float] = (3.0, 8.0),
+) -> Dict[str, float]:
+    """
+    Raw-signal QC on the UNPROCESSED mito channel (T, Z, Y, X), measured before any haze removal
+    or normalization (both of which stretch pure noise into apparent structure):
+      signal = P99.9 of the time-averaged, lightly smoothed stack inside the cell
+               minus its median in a background ring 3-8 um outside the cell;
+      noise  = median per-pixel temporal SD in that ring (spatial SD if T == 1).
+    contrast_sigma = signal / noise is how far mitochondria stand above single-frame noise.
+    """
+    sampling = (calib["dz_um"], calib["dy_um"], calib["dx_um"])
+    dist_out = ndimage.distance_transform_edt(~cell_mask, sampling=sampling)
+    ring = (dist_out > ring_um[0]) & (dist_out < ring_um[1])
+    if not ring.any():
+        ring = ~cell_mask
+    if not ring.any() or not cell_mask.any():
+        return {"signal_counts": 0.0, "noise_sd": 0.0, "contrast_sigma": 0.0}
+    tavg = ndimage.gaussian_filter(ch_mito.mean(axis=0), sigma=(0.5, 1.0, 1.0))
+    signal = float(np.percentile(tavg[cell_mask], 99.9) - np.median(tavg[ring]))
+    if ch_mito.shape[0] > 1:
+        noise = float(np.median(ch_mito[:, ring].std(axis=0)))
+    else:
+        noise = float(ch_mito[0][ring].std())
+    return {
+        "signal_counts": round(signal, 2),
+        "noise_sd": round(noise, 3),
+        "contrast_sigma": round(signal / max(noise, 1e-6), 2),
+    }
+
+
+def remove_haze_then_gate_inplace(ch_mito: np.ndarray, gate_mask: np.ndarray, radius_px: int) -> None:
+    """
+    3x3 median despeckle + white top-hat on the UNGATED stack, then zero everything outside the
+    dilated cell mask. Order matters: gating first creates a hard 0-edge, and a top-hat subtracts
+    nothing from any bright region narrower than its kernel that is surrounded by zeros, so thin
+    processes would keep 100% of their haze and the mask rim would turn into bright artifacts.
+    """
+    ksize = 2 * max(3, int(radius_px)) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    for t in range(ch_mito.shape[0]):
+        for z in range(ch_mito.shape[1]):
+            despeckled = cv2.medianBlur(np.ascontiguousarray(ch_mito[t, z], dtype=np.float32), 3)
+            ch_mito[t, z] = cv2.morphologyEx(despeckled, cv2.MORPH_TOPHAT, kernel)
+    ch_mito *= gate_mask[np.newaxis, :, :, :]
+
+
 def preprocess_movie(
     input_path: Path, work_dir: Path, cfg: Dict[str, Any], dry_run: bool = False
 ) -> Dict[str, Any]:
@@ -350,6 +448,8 @@ def preprocess_movie(
         dz_um=calib["dz_um"],
         pad_xy_um=float(crop_cfg.get("padding_xy_um", 5.0)),
         pad_z_um=float(crop_cfg.get("padding_z_um", 2.0)),
+        bg_sigma_xy_um=float(p_cfg.get("cytosolic_roi_gate", {}).get("background_sigma_xy_um", 5.0)),
+        bg_sigma_z_um=float(p_cfg.get("cytosolic_roi_gate", {}).get("background_sigma_z_um", 3.0)),
     )
     z_min, z_max, y_min, y_max, x_min, x_max = bbox
 
@@ -369,8 +469,19 @@ def preprocess_movie(
     )
     dilated_mask = dist_outside_um <= dil_rad_um
 
-    # Zero out extracellular autofluorescence across all frames
-    ch_mito_cropped *= dilated_mask[np.newaxis, :, :, :]
+    # Raw-signal QC before any processing (haze removal + normalization make noise look like signal)
+    raw_contrast = measure_raw_mito_contrast(ch_mito_cropped, cell_mask_exact, calib)
+    print(
+        f"[{movie_id}] Raw mito-channel contrast: {raw_contrast['signal_counts']} counts over "
+        f"noise SD {raw_contrast['noise_sd']} = {raw_contrast['contrast_sigma']} sigma"
+    )
+
+    # 3b. Despeckle + top-hat haze removal on the UNGATED stack, THEN zero extracellular voxels
+    print(f"[{movie_id}] Applying 2D median filter and OpenCV morphological top-hat haze removal...")
+    denoise_cfg = p_cfg.get("denoising", {})
+    remove_haze_then_gate_inplace(
+        ch_mito_cropped, dilated_mask, int(round(float(denoise_cfg.get("rolling_ball_radius_px", 15.0))))
+    )
 
     # 4. Axial Z-Attenuation & Temporal Bleach Correction (Fast 16-bit LUT Histogram Matching)
     z_cfg = p_cfg.get("z_attenuation_correction", {})
@@ -385,23 +496,7 @@ def preprocess_movie(
     for t in range(1, n_t):
         ch_mito_cropped[t] = match_histogram_fast_16bit(ch_mito_cropped[t], ref_t0)
 
-    # 5. Shot-Noise Despeckling & C++-Accelerated OpenCV White Top-Hat Haze Subtraction
-    print(f"[{movie_id}] Applying 2D median filter and OpenCV morphological top-hat haze removal...")
-    denoise_cfg = p_cfg.get("denoising", {})
-    r_roll_px = max(3, int(round(float(denoise_cfg.get("rolling_ball_radius_px", 15.0)))))
-    ksize = 2 * r_roll_px + 1
-    ellip_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-
-    for t in range(n_t):
-        for z in range(ch_mito_cropped.shape[1]):
-            sl = ch_mito_cropped[t, z]
-            if np.max(sl) > 0:
-                # 3x3 median filter removes single-pixel camera shot noise
-                despeckled = cv2.medianBlur(sl.astype(np.float32), 3)
-                # Morphological white top-hat strips diffuse cytoplasmic GFP haze ~15x faster than scipy
-                ch_mito_cropped[t, z] = cv2.morphologyEx(
-                    despeckled, cv2.MORPH_TOPHAT, ellip_kernel
-                )
+    # 5. (Despeckle + top-hat now run in step 3b, before gating.)
 
     # 6. Cross-Day Percentile Normalization
     norm_cfg = p_cfg.get("intensity_normalization", {})
@@ -443,6 +538,11 @@ def preprocess_movie(
     qc_pass = (snr >= float(norm_cfg.get("min_snr_gate", 2.5))) and (
         max_drift_um <= float(drift_cfg.get("qc_max_total_drift_um", 15.0))
     )
+    min_contrast = float(p_cfg.get("raw_signal_qc", {}).get("min_contrast_sigma", 3.0))
+    if raw_contrast["contrast_sigma"] < min_contrast:
+        qc_status = "FAIL_NO_SIGNAL"
+    else:
+        qc_status = "PASS" if qc_pass else "QC_WARNING"
 
     metrics = {
         "movie_id": movie_id,
@@ -463,7 +563,9 @@ def preprocess_movie(
             "pre_norm_p1_0": round(float(p_low), 1),
             "pre_norm_p99_9": round(float(p_high), 1),
             "estimated_snr": snr,
-            "qc_status": "PASS" if qc_pass else "QC_WARNING",
+            "raw_mito_contrast": raw_contrast,
+            "raw_mito_min_contrast_sigma": min_contrast,
+            "qc_status": qc_status,
         },
     }
     provenance_json = work_dir / f"{movie_id}_provenance.json"
@@ -487,10 +589,16 @@ def main() -> int:
 
     cfg = load_config(args.config)
     res = preprocess_movie(args.input, args.work_dir, cfg, dry_run=args.dry_run)
-    print(
-        f"[SUCCESS] Preprocessing completed for {res['movie_id']} "
-        f"(QC: {res['stage3_preprocessing_metrics']['qc_status']})"
-    )
+    status = res["stage3_preprocessing_metrics"]["qc_status"]
+    if status == "FAIL_NO_SIGNAL":
+        # Outputs are written (for inspection), but segmenting this movie would only segment noise.
+        print(
+            f"[QC FAIL] {res['movie_id']}: no detectable mito-channel signal "
+            f"({res['stage3_preprocessing_metrics']['raw_mito_contrast']}). Stopping before Stage 4.",
+            file=sys.stderr,
+        )
+        return EXIT_QC_FAIL
+    print(f"[SUCCESS] Preprocessing completed for {res['movie_id']} (QC: {status})")
     return 0
 
 

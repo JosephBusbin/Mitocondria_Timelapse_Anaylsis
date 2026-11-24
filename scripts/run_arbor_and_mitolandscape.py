@@ -84,6 +84,8 @@ def compute_internal_geodesic_distance_3d(
         phi[soma_mask > 0] = -1.0
         masked_phi = np.ma.MaskedArray(phi, mask=(cell_mask == 0))
         dist_um = skfmm.distance(masked_phi, dx=(dz, dy, dx))
+        # skfmm is a signed distance (negative inside the soma); the soma interior is distance 0.
+        dist_um = np.maximum(np.ma.filled(dist_um, 0.0), 0.0)
         return np.asarray(np.where(cell_mask > 0, dist_um, 0.0), dtype=np.float32)
     except ImportError:
         pass
@@ -391,10 +393,16 @@ def profile_all_instances_fast(
     calib: Dict[str, float],
     geodesic_map: np.ndarray,
     compartment_map: np.ndarray,
+    cell_mask: np.ndarray = None,
+    snap_um: float = 1.5,
 ) -> Tuple[Dict[Tuple[int, int], Dict[str, Any]], Dict[str, int], Dict[int, int]]:
     """
     Profiles all mitochondrial instances across all T frames in O(N) time using
     scipy.ndimage.find_objects bounding-box slicing.
+
+    A barycenter that falls outside the exact cell mask (the mito channel is gated with a mask
+    dilated by snap_um) is moved to the nearest cell voxel when it is within snap_um; farther
+    out it is reported as compartment 0 'outside_cell' with an undefined (NaN) geodesic distance.
     """
     n_t = labels_4d.shape[0]
     dx, dy, dz = calib["dx_um"], calib["dy_um"], calib["dz_um"]
@@ -403,7 +411,14 @@ def profile_all_instances_fast(
     mito_features: Dict[Tuple[int, int], Dict[str, Any]] = {}
     subtype_counts = {"punctus": 0, "rod": 0, "network": 0}
     comp_volume_vox = {1: 0, 2: 0, 3: 0, 4: 0}
-    comp_names = {1: "soma", 2: "apical_process", 3: "basal_process", 4: "endfoot"}
+    comp_names = {0: "outside_cell", 1: "soma", 2: "apical_process", 3: "basal_process", 4: "endfoot"}
+
+    if cell_mask is None:
+        cell_mask = compartment_map > 0
+    # Distance (um) from every voxel to the nearest cell voxel, and that voxel's index.
+    dist_out_um, nearest_idx = ndimage.distance_transform_edt(
+        ~cell_mask, sampling=(dz, dy, dx), return_indices=True
+    )
 
     for t in range(n_t):
         lbl_t = labels_4d[t]
@@ -433,10 +448,14 @@ def profile_all_instances_fast(
             else:
                 subtype = "punctus"
 
-            geo_dist = float(geodesic_map[bary_z, bary_y, bary_x])
-            comp_id = int(compartment_map[bary_z, bary_y, bary_x])
-            if comp_id == 0:
-                comp_id = 3  # Default to process if on dilated boundary edge
+            if not cell_mask[bary_z, bary_y, bary_x] and dist_out_um[bary_z, bary_y, bary_x] <= snap_um:
+                bary_z, bary_y, bary_x = (int(nearest_idx[k][bary_z, bary_y, bary_x]) for k in range(3))
+            if cell_mask[bary_z, bary_y, bary_x]:
+                geo_dist = float(geodesic_map[bary_z, bary_y, bary_x])
+                comp_id = int(compartment_map[bary_z, bary_y, bary_x])
+            else:
+                geo_dist = float("nan")
+                comp_id = 0
 
             f_dict = {
                 "barycenter_x_um": round(bary_x * dx, 4),
@@ -445,9 +464,9 @@ def profile_all_instances_fast(
                 "barycenter_z_px": bary_z,
                 "barycenter_y_px": bary_y,
                 "barycenter_x_px": bary_x,
-                "geodesic_soma_dist_um": round(geo_dist, 4),
+                "geodesic_soma_dist_um": round(geo_dist, 4) if math.isfinite(geo_dist) else float("nan"),
                 "compartment_id": comp_id,
-                "compartment_name": comp_names.get(comp_id, "basal_process"),
+                "compartment_name": comp_names[comp_id],
                 "morphology_class": subtype,
                 "branch_length_um": round(length_um, 4),
                 "volume_um3": round(vol_um3, 4),
@@ -512,8 +531,11 @@ def main() -> int:
 
     # 3. Fast Bounding-Box Instance Profiling across all T
     print(f"[{args.movie_id}] Profiling mitochondrial graph barycenters and subtypes...")
+    snap_um = float(
+        cfg.get("stage3_preprocessing", {}).get("cytosolic_roi_gate", {}).get("dilation_radius_um", 1.5)
+    )
     mito_features, subtype_counts, comp_volume_vox = profile_all_instances_fast(
-        labels_4d, calib, geo_map, comp_map
+        labels_4d, calib, geo_map, comp_map, cell_mask=cell_mask, snap_um=snap_um
     )
 
     # 4. Exact-Key Join onto TrackMate spots.csv via (FRAME, int(round(MEAN_INTENSITY_CH1)))
@@ -550,7 +572,9 @@ def main() -> int:
                     )
                     v_geo = round((d_tgt - d_src) / dt_edge, 4)
 
-                    if v_geo > vel_thresh:
+                    if not math.isfinite(v_geo):
+                        t_state = "OUTSIDE_CELL"  # an endpoint lies outside the cell mask
+                    elif v_geo > vel_thresh:
                         t_state = "ANTEROGRADE_DISTAL"
                     elif v_geo < -vel_thresh:
                         t_state = "RETROGRADE_PROXIMAL"

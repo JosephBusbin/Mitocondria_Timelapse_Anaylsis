@@ -14,6 +14,15 @@ When opening the [ilastik startup screen](https://www.ilastik.org/documentation/
 | **6. Boundary-Based Segmentation with Multicut** | Uses boundary probability maps and graph partitioning to segment closed membrane-stained cells (primarily for 3D Electron Microscopy). | **REJECTED** — Requires clear dark/bright boundary rings around every object; matrix-labeled `mito-EGFP` mitochondria at $0.16\ \mu\text{m}$ pixel size are solid diffraction-limited rods/puncta (~3–6 px wide) without hollow interiors. |
 | **7. Carving & Neural Network Classification** | Interactive 3D seeded watershed for single objects (`Carving`) or BioImage.IO PyTorch runner (`Neural Network`). | **REJECTED** — `Carving` is manual per object, and `Stage 4B` already runs PyTorch Cellpose/Omnipose natively with 2D-to-3D anisotropic stitching. |
 
+
+> **Update 2026-11-24 — what happens after ilastik (Stage 4B).** The rows above refer to "Stage 4B (Cellpose 3 / Omnipose)". The reasoning about **touching mitochondria** still holds:
+> - Plain thresholding of the probability map (Object Classification) merges organelles that share a continuous foreground region in a thin process. That is why a dedicated splitting step follows ilastik.
+> - The pipeline's **default splitter is now a seeded 3D watershed** (`engine: watershed`). **Cellpose remains a selectable option** (`engine: cellpose`) and uses a GPU automatically.
+> - On practice Series #39, stock Cellpose `cyto3` (a whole-cell model) covered only 18% of the mitochondrial foreground; the watershed covered 100%.
+> - The final choice will be made on a representative sample of real data: `manuals/future_task_representative_sample_validation.md`.
+>
+> **For training, this means a clean, well-separated probability map matters more than ever.** Paint `Background` in the dim gaps *between* touching mitochondria (Rule B), because that dip is where the watershed draws the boundary.
+
 ---
 
 ## Part 2: Step-by-Step Reproducible Protocol for Training ilastik (`bestman_mito_2d_v1.ilp`)
@@ -24,6 +33,7 @@ Because `preprocess_4d_stack.py` (Module 1) strips out extracellular autofluores
 ---
 
 ### Step 1: Select & Prepare 3 Representative Training Stacks
+0. **Only train on movies that passed Stage 3's raw-signal QC.** Check `<movie_id>_provenance.json` → `stage3_preprocessing_metrics.qc_status` is `PASS` and `raw_mito_contrast.contrast_sigma` is ≥ 3. A movie whose mito channel is indistinguishable from camera noise still produces a `mito_norm.tif`, because normalization stretches noise into apparent texture. A classifier trained on such a movie learns nothing useful. (This happened with the first test classifier: practice Series #20's mito channel measured about 0 σ.)
 1. Run `preprocess_4d_stack.py` on **3 diverse movies** spanning your dataset's conditions:
    * **Stack A**: A high-SNR representative movie from an early cohort (e.g., 2023).
    * **Stack B**: A deeper, higher-scattering movie (e.g., $>100\ \mu\text{m}$ depth or dimmer expression).
@@ -71,6 +81,8 @@ Because `preprocess_4d_stack.py` (Module 1) strips out extracellular autofluores
    * Press **`t`** (or click the Window Leveling icon) and drag the mouse to adjust visual brightness so dim tubules are easy to see. *(Per the ilastik manual, this only adjusts screen display and never alters pixel values.)*
 3. **Follow Strict "Sparse Center & Border" Brush Rules (`Brush Size = 1`)**:
    * **Rule A — Never paint across an entire mitochondrion**: Use **`Brush Size = 1`** and draw a thin 1-pixel line strictly down the **bright core/spine** of 5–8 representative mitochondria (include both bright somatic mitochondria and dimmer shaft rods). If you paint fuzzy outer halos as `Mitochondria`, the classifier will artificially bloat organelle volumes and merge neighbors.
+   * **Rule A2 — Cover the full brightness range, not just the brightest cores**: at least half of your `Mitochondria` strokes should be on **dim** mitochondria (in the shaft, deep Z-slices, later frames). Label across **several Z-slices and every loaded frame**, not one plane. Otherwise the Random Forest learns "brighter than X" rather than "shaped like a mitochondrion". The first test classifier had 137 mito voxels painted mostly on saturated cores; its output correlated 0.97 with raw intensity, so it was effectively a threshold.
+   * **Rule A3 — Label dim background texture as `Background`**: paint a few strokes on grainy cytoplasm and noise *inside* the cell, not only on empty black space. That is what teaches the classifier noise is not mitochondria.
    * **Rule B — Paint the "Clefts" Between Closely Spaced Mitochondria**: Zoom in ($400\%$) on the thin radial glial process where two mitochondria sit end-to-end or side-by-side. Select `Background` (`Brush Size = 1`) and place a 1–2 pixel dot/stroke directly in the **dim gap/trough between the two mitochondria**, plus a stroke along the immediate outer edge of the tubule and a broad stroke (`Brush Size = 3`) in the empty black background.
 4. **Activate `Live Update` & Use the `Uncertainty` Layer**:
    * Click **Live Update** (Manual p. 22, Fig. 2.12).

@@ -158,3 +158,51 @@ squeue -u $USER; sacct -j <jobid> --format=JobID,State,Elapsed,MaxRSS
     - New Step 6: save, close, record SHA256, transfer with `scp` or VS Code Upload, verify with `sha256sum` and the HDF signature.
     - The provenance block is updated.
   - User decision recorded: the 11.7 s vs 120 s question is deferred until real data arrives. The working assumption stays 11.7 s, and heterogeneous data may be split into groups (an upcoming filtering task).
+- **2026-11-23/24 (Claude Opus 5.5)**: First full Stage 3→5 run with the user's trained `.ilp`, plus per-stage QC.
+  - Job 703461 ran Stages 3–5 successfully (1 h 56 min, 14.1 GB peak). Stage 4A used ilastik, as recorded in provenance. The ilastik `--ram` now follows the Slurm allocation.
+  - New `scripts/qc_pipeline_outputs.py`: a read-only per-stage QC report.
+  - QC finding: the practice movie's mito channel (ch1) has no detectable signal (in-cell minus background = −0.13 counts). Stage 4/5 outputs on it are segmentations of noise and are **not scientifically valid**.
+  - Bugs found, fixes pending approval:
+    - Stage 3 gates before the top-hat, which saturates thin processes and makes mask-edge artifacts.
+    - The Stage 3 SNR QC passes noise.
+    - Stage 5B mislabels outside-mask spots as basal with distance 0, and soma distances are negative.
+  - Design weaknesses noted: Cellpose is not constrained by ilastik foreground, and the tracker calls every nearby appearance a fission.
+- **2026-11-24 (Claude Opus 5.5)**: Pipeline fixes from stage-by-stage QC, plus a mito-construct filename filter.
+  - **User modifications**:
+    - Added `bestman_lab_data/Plasmid_Primer_List_Bestman_Lab.csv` (204 plasmids, read-only input).
+    - Supplied two TIFF projections.
+    - Trained and uploaded a test `.ilp`. It was trained on a series with no mito signal, so it must be retrained on a QC-PASS movie.
+  - **Stage 3** (`preprocess_4d_stack.py`):
+    - Raw-signal QC (`FAIL_NO_SIGNAL`, exit 3; the Slurm job stops before Stage 4 unless `MITO_IGNORE_QC=1`).
+    - Top-hat now runs before gating.
+    - Drift uses background-subtracted phase correlation with a per-frame step limit. Practice Series #39 drifted 79 px, which the old code reported as ≤ 5 px.
+    - The cell mask subtracts out-of-focus glow before Triangle. The old mask merged a neighbouring soma in Series #20.
+  - **Stage 4**: Cellpose runs only inside the ilastik foreground box, and objects are gated by mean probability. The fallback estimator uses a fixed scale.
+  - **Stage 5A**: fission/fusion require signal conservation (`split_merge_max_intensity_ratio` 1.5), and CSVs are always written.
+  - **Stage 5B**: outside-mask spots are snapped (≤ 1.5 µm) or labelled `outside_cell` instead of silently becoming `basal_process` at 0 µm. Soma distance ≥ 0.
+  - New `scripts/qc_pipeline_outputs.py` (per-stage QC report).
+  - **Mito-construct filter** (subagent-built, verified in the main session):
+    - New files: `scripts/construct_classifier.py`, `config/construct_lexicon.json`, `scripts/test_construct_classifier.py` (37 tests) and `manuals/construct_filter_guide.md`.
+    - File names are classified by the `mls` tag, plasmid IDs looked up in the lab table (`obf01` = OBF001, zero-padding tolerant) and common mito markers.
+    - Labels: `MITO` / `MITO_PHOTOACTIVATABLE` (excluded by default) / `NOT_MITO` / `REVIEW`, plus `mito_color` and `red_mito_flag`.
+    - Wired into `collect_4d_sld_timelapses.py` with `--plasmid-csv`, `--mito-filter {off,report,require}`, `--mito-overrides` and `--construct-lexicon`. Non-MITO files are skipped before Bio-Formats (`SKIPPED_NOT_MITO`).
+    - New test 01o.
+    - On the real folder, the practice `.sld` is classified `MITO_PHOTOACTIVATABLE` (mito-paGFP) and excluded.
+- **2026-11-24 (Claude Opus 5.5, cont.)**: **Stage 4B default changed to a seeded 3D watershed; Cellpose kept as a prominent option.**
+  - **Why Stage 4B exists — touching objects.** ilastik only labels which voxels are mitochondria. In a 1–2 µm radial-glia process, mitochondria lying end-to-end or side-by-side form ONE continuous foreground region. Stage 4B must split them:
+    - merge errors under-count organelles, inflate volumes and fake fusion/fission;
+    - split errors do the reverse.
+    - Both engines are touching-object splitters.
+  - **Evidence** (practice Series #39, frame 0, CPU, same probability map): watershed 100% coverage, 0% spill, 5 s; Cellpose `cyto3` d=8 7 objects, 18% coverage, 45% spill, 433 s, missing every punctum along the process. d=15 was no better.
+  - **Why Cellpose is suspected to fail** (to be re-checked on real data): `cyto3` is trained on whole cells (about 30 px, textured), while mitochondria here are 2–6 px puncta and rods.
+  - **Implementation** (`run_hybrid_segmentation.py`):
+    - `segment_instances()` dispatches on `engine`.
+    - `watershed_split_3d()` is now a real flooding watershed (`skimage`): h-maxima seeds on distance-to-edge × intensity, seed spacing and prominence set in µm (`watershed:` block in `pipeline_config.yaml`), and unseeded components are kept.
+    - `engine: cellpose` uses a GPU automatically when torch sees one; if Cellpose cannot be imported, the watershed is used with a warning.
+    - Provenance records `instance_engine`.
+    - `min_volume_um3` raised from 0.05 to 0.10 (about 3 voxels) to drop 1–2-voxel noise specks.
+    - The unused `anisotropy` key was removed.
+  - Test 05d checks that a touching pair splits into 2, a 3-slice rod stays 1, two touching 3 × 3 puncta split into 2, and unknown engines are rejected. **33/33 pass on bora.**
+  - With h-maxima seeds, #39 frame 0 gives 37 objects (previously 103 with the old nearest-seed partition). Endfoot overlay: `/sciclone/scr30/jbusbin/mito_qc_png/endfoot_ws_S39_t0.png`.
+  - **Future task:** `manuals/future_task_representative_sample_validation.md`, a stratified random sample of the real archive. It includes a watershed vs Cellpose (stock and fine-tuned, GPU) comparison on hand-annotated touching mitochondria. The user approved removing Cellpose if it fails there.
+  - Also updated `mitochondria_hpc_pipeline_plan.md` (Phase 4 status + Checkpoint 4), `pipeline_agent_spec.md` and `manuals/ilastik_training_protocol.md`.

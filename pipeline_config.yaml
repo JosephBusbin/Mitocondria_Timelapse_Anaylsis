@@ -19,6 +19,10 @@ metadata_defaults:
   expected_dt_s: 11.7           # Fallback only if OME-XML TimeIncrement is missing
 
 stage3_preprocessing:
+  raw_signal_qc:
+    min_contrast_sigma: 3.0     # Raw mito channel: (in-cell P99.9 - background median) / per-frame noise SD.
+                                # Below this the movie is FAIL_NO_SIGNAL and the Slurm job stops before Stage 4
+                                # (practice Series #20 ch1 measured ~0; override per run with MITO_IGNORE_QC=1).
   drift_correction:
     enabled: true
     engine: "Fast4DReg"         # Pylvänäinen et al. (2023) J. Cell Sci. (4x-70x faster than Correct 3D drift)
@@ -26,8 +30,8 @@ stage3_preprocessing:
     xy_projection_type: "Max_Intensity"
     z_projection_type: "Max_Intensity"
     time_averaging: 1           # Frames to average during cross-correlation
-    max_shift_xy_px: 25         # ~4.0 um max frame-to-frame shift in X,Y
-    max_shift_z_px: 5           # 5.0 um max frame-to-frame shift in Z
+    max_shift_xy_px: 25         # Max drift CHANGE between consecutive frames (px); total drift may exceed it
+    max_shift_z_px: 5           # Max drift CHANGE between consecutive frames (slices)
     qc_max_total_drift_um: 15.0 # Flag warning in JSON if cumulative drift > 15 um
 
   auto_crop_3d:
@@ -41,6 +45,8 @@ stage3_preprocessing:
     gaussian_sigma_xy_px: 2.0
     gaussian_sigma_z_px: 1.0
     threshold_method: "Triangle" # Triangle thresholding captures dim radial shafts
+    background_sigma_xy_um: 5.0 # Broad out-of-focus glow subtracted before thresholding (0 = off)
+    background_sigma_z_um: 3.0
     keep_largest_cc: true       # MorphoLibJ largest 3D connected component -> saved as *_cell_mask.tif
     dilation_radius_um: 1.5     # Dilate by 1.5 um to gate Ch1 (mito-EGFP) extracellular noise
 
@@ -73,16 +79,38 @@ stage4_hybrid_segmentation:
     feature_mode: "2D_slices"   # Prevents 1.0 um Z-step blur across adjacent planes
 
   stage4b_instance_segmentation:
-    engine: "cellpose"          # Options: "cellpose" (Cellpose 3, Stringer 2025) or "omnipose" (Cutler 2022)
-    model_type: "cyto3"         # Or path to fine-tuned "bestman_mito_tube.pth"
+    # Stage 4B separates TOUCHING mitochondria: ilastik's foreground merges organelles that lie
+    # end-to-end/side-by-side in a thin process into one region; counts, volumes and fission/fusion
+    # are only meaningful after that region is split into individual instances.
+    engine: "watershed"         # "watershed" (default; seeded 3D watershed, CPU, seconds/frame)
+                                # "cellpose"  (Cellpose 3, industry standard; auto-uses a GPU when present)
+                                # Default chosen 2026-11-24 from practice Series #39 (frame 0): watershed
+                                # 100% foreground coverage, 103 objects, 5 s; Cellpose cyto3 18% coverage,
+                                # 7 objects (45% of their area outside mitochondria), 433 s on CPU, missed
+                                # all puncta along the process. Suspected cause: cyto3 is a whole-CELL model
+                                # (objects ~30 px, textured) while mitochondria are 2-6 px puncta/rods.
+                                # Re-evaluate on the representative real-data sample (manuals/
+                                # future_task_representative_sample_validation.md), incl. GPU + fine-tuned models.
+    foreground_probability_threshold: 0.5 # Foreground = ilastik P > this; both engines work only inside it (+ margin)
+    min_object_mean_probability: 0.5      # Drop instances whose mean ilastik P is below this (noise objects)
+    min_volume_um3: 0.10        # Physical volume floor (~3 voxels at 0.19 x 0.19 x 1.0 um); was 0.05 (MitoLandscape),
+                                # raised to drop 1-2 voxel noise specks seen on Series #39
+
+    watershed:                  # engine: "watershed"
+      seed_min_separation_xy_um: 0.4 # Two seeds (= two organelles) must be >= this far apart in XY ...
+      seed_min_separation_z_um: 1.0  # ... and in Z. Smaller = more splitting (risk: one rod cut in two);
+                                     # larger = less splitting (risk: touching organelles merged).
+      seed_min_prominence_um: 0.05   # A peak must rise >= this (um of distance-to-edge) above the dip between
+                                     # neighbours to become its own organelle; suppresses double seeds on flat tops.
+
+    # engine: "cellpose" settings
+    model_type: "cyto3"         # Stock whole-cell model; or path to a fine-tuned mitochondria model (.pth)
     input_mode: "dual_channel"  # Stack [Ch1: mito_norm, Ch2: ilastik_prob]
-    diameter_px: 8.0            # ~1.28 um characteristic diameter for thin tubules
+    diameter_px: 8.0            # Expected object diameter in px (Cellpose upsamples by ~30/diameter -> slow on CPU)
     flow_threshold: 0.40        # Higher = more permissive instance splitting
     cellprob_threshold: 0.0     # Logit threshold (0.0 corresponds to P = 0.50)
     do_3d: false                # Disable isotropic 3D; use 2D + Z-stitching for 1.0 um Z
     stitch_threshold: 0.35      # 2D-to-3D mask IoU stitching threshold across Z slices
-    anisotropy: 6.25            # PhysicalSizeZ / PhysicalSizeX = 1.0 / 0.16 = 6.25
-    min_volume_um3: 0.05        # Hardcoded physical volume floor from MitoLandscape / Mitochondria Analyzer (~2 voxels)
 
 stage5_tracking_and_mitolandscape:
   trackmate_detector:
@@ -100,6 +128,7 @@ stage5_tracking_and_mitolandscape:
     splitting_max_distance_um: 2.0
     allow_track_merging: true   # Mitochondrial Fusion
     merging_max_distance_um: 2.0
+    split_merge_max_intensity_ratio: 1.5 # Fission/fusion only if parent/(daughter1+daughter2) mito signal is in [1/1.5, 1.5]
     min_track_spots: 4          # Keep trajectories present in >= 4 timepoints
 
   snt_autotrace:

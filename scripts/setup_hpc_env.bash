@@ -93,9 +93,11 @@ ACTIVATE_HELPER="${TOOLS_DIR}/activate_mito4d.sh"
 # ------------------------------------------------------------------------------
 # 2. Node-local cache & temporary directories (cleaned up on exit)
 # ------------------------------------------------------------------------------
+# Node-local /local/$USER when it exists; otherwise scratch. NEVER /tmp: on hima GPU nodes /tmp is a
+# 10 GB shared partition and CUDA wheels filled it to 100% (2026-11-24).
 LOCAL_BASE="/local/${CURRENT_USER}"
 if [[ ! -d "${LOCAL_BASE}" ]] || [[ ! -w "${LOCAL_BASE}" ]]; then
-    LOCAL_BASE="${TMPDIR:-/tmp}/${CURRENT_USER}_local"
+    LOCAL_BASE="/sciclone/scr30/${CURRENT_USER}/node_cache"
 fi
 TMP_DL_DIR="${LOCAL_BASE}/tmp_install_$$"
 export UV_CACHE_DIR="${LOCAL_BASE}/uv_cache"
@@ -315,8 +317,14 @@ export BF_CP="${SB_JAR}"
 export PATH="${BFTOOLS_DIR}:\${PATH}"
 # Cellpose downloads model weights on first use; keep them off the shared \$HOME quota.
 export CELLPOSE_LOCAL_MODELS_PATH="${TOOLS_DIR}/cellpose_models"
-export UV_CACHE_DIR="/local/\${USER:-\$(whoami)}/uv_cache"
-export PIP_CACHE_DIR="/local/\${USER:-\$(whoami)}/pip_cache"
+# Caches: node-local /local/\$USER if present, else scratch (never the small shared /tmp)
+if [[ -d "/local/\${USER:-\$(whoami)}" && -w "/local/\${USER:-\$(whoami)}" ]]; then
+    _mito_cache="/local/\${USER:-\$(whoami)}"
+else
+    _mito_cache="/sciclone/scr30/\${USER:-\$(whoami)}/node_cache"
+fi
+export UV_CACHE_DIR="\${_mito_cache}/uv_cache"
+export PIP_CACHE_DIR="\${_mito_cache}/pip_cache"
 EOF
 chmod +x "${ACTIVATE_HELPER}"
 

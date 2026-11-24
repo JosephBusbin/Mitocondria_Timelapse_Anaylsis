@@ -91,6 +91,16 @@ In Benchmark Figure 10 and Supplementary Figure S2 of **[MitoLandscape (Negri et
       * *Minimal Human-in-the-Loop Option (30 mins total)*: Open 5 cropped $Z$-slices in the Cellpose GUI, click "Run", correct 10–15 touching mitochondria in the thin radial shaft, and click "Train" to save `bestman_mito_tube.pth`.
       * *Anisotropic 3D Stitching (`stitch_threshold = 0.35`, `anisotropy = 6.25`)*: Runs 2D flow prediction per slice and links 3D instances across $Z$ using IoU overlap (`stitch_threshold = 0.35`), outputting a 16-bit 3D instance label stack (`*_mito_labels.tif`) where every mitochondrion has a unique integer ID ($1 \dots N$).
 
+> **Status update 2026-11-24 — Stage 4B default changed to a seeded 3D watershed; Cellpose kept as a prominent option.**
+> - **The key distinction is touching objects.** ilastik's foreground merges mitochondria that lie end-to-end or side-by-side in a thin process into ONE region. Stage 4B must split them; merge errors under-count organelles, inflate volumes and fake fusion/fission, while split errors do the reverse.
+>   - The original argument for Cellpose was that its flows split touching tubules where *plain thresholding* (ilastik Object Classification) cannot. A seeded watershed is also a touching-object splitter, so that argument does not favour Cellpose over a watershed.
+> - **Evidence (practice Series #39, frame 0, CPU):**
+>   - Watershed: 100% foreground coverage, 0% spill, 5 s.
+>   - Cellpose `cyto3` (d = 8): 7 objects, 18% coverage, 45% of object area outside the mitochondria, 433 s. It missed every punctum along the process.
+> - **Suspected cause:** `cyto3` is a whole-cell model (objects about 30 px); mitochondria here are 2–6 px puncta and rods.
+> - **Implementation:** `engine: watershed` (h-maxima seeds, spacing in µm) is the default; `engine: cellpose` stays selectable and uses a GPU automatically.
+> - **Not yet decided:** the final choice will be made on a representative random sample of the real archive, comparing watershed vs stock and fine-tuned Cellpose (GPU) on hand-annotated touching mitochondria. See `manuals/future_task_representative_sample_validation.md`. If Cellpose fails there, it may be removed.
+
 ## Phase 5: Automated 4D Tracking & MitoLandscape Subcellular Profiling on HPC
 
 15. **Step 5A — Batch TrackMate 7 Execution (`LabelImageDetector` + `SparseLAPTracker`)**
@@ -146,7 +156,8 @@ Use these checkpoints as a live lab notebook checklist as you complete each phas
 ### Checkpoint 4: Two-Stage Hybrid Segmentation Log (ilastik + Cellpose/Omnipose) (After Phase 4)
 * [ ] **Stage 4A (ilastik) Provenance**:
   * Exact ilastik version on PC and HPC, filenames/timepoints used for training, selected 2D feature scales ($\sigma$), and brush-stroke decision rules.
-* [ ] **Stage 4B (Cellpose / Omnipose) Provenance**:
+* [ ] **Stage 4B engine** (recorded automatically in provenance as `instance_engine`): `watershed` (default since 2026-11-24) with `seed_min_separation_xy_um`, `seed_min_separation_z_um`, `seed_min_prominence_um`, `min_volume_um3`; or `cellpose` as below.
+* [ ] **Stage 4B (Cellpose / Omnipose) Provenance** (when `engine: cellpose`):
   * Exact package versions (`cellpose` / `omnipose`, `torch`, CUDA version).
   * Model identifier (`cyto3`, `bact_fluor_omni`, or custom `bestman_mito_tube.pth` + list of the 5–10 training slices if fine-tuned).
   * Exact inference parameters: `diameter` (px), `flow_threshold` (default `0.4`), `cellprob_threshold` (default `0.0`), `anisotropy` ($\Delta z / \Delta xy = 6.25$), and `stitch_threshold` (`0.35` for 2D-to-3D slice stitching).
