@@ -52,7 +52,9 @@ stage3_preprocessing:
 
   z_attenuation_correction:
     enabled: true
-    trigger_drop_ratio: 0.30    # Apply Z-slice histogram matching if deep Z drops >30%
+    trigger_drop_ratio: 0.30    # Apply a smooth depth gain if the CYTOSOLIC channel (in-cell signal above background)
+                                # fitted with an exponential drops >30% across the cell; never histogram-matches slices
+    max_gain: 3.0               # Cap on the depth gain applied to the mito channel
 
   bleach_correction:
     enabled: true
@@ -73,10 +75,12 @@ stage3_preprocessing:
 stage4_hybrid_segmentation:
   stage4a_ilastik:
     enabled: true
-    project_file: "bestman_mito_2d_v1.ilp"
+    project_file: "bestman_mito_2d_v3.ilp"  # v3 (2026-11-24): S39 frames 0/2/5, 2D features, 44% in-cell Background; v2 failed (99% of cell called mito)
     export_source: "Probabilities"
     foreground_class_index: 0   # Channel 0 of exported probabilities = Mitochondria
     feature_mode: "2D_slices"   # Prevents 1.0 um Z-step blur across adjacent planes
+    max_foreground_fraction_of_cell: 0.5 # Stage 4 stops (exit 5) if P>threshold covers more of the cell mask than this;
+                                        # mitochondria fill a minority of cytoplasm (v2 .ilp: 99% -> retrain)
 
   stage4b_instance_segmentation:
     # Stage 4B separates TOUCHING mitochondria: ilastik's foreground merges organelles that lie
@@ -102,6 +106,11 @@ stage4_hybrid_segmentation:
                                      # larger = less splitting (risk: touching organelles merged).
       seed_min_prominence_um: 0.05   # A peak must rise >= this (um of distance-to-edge) above the dip between
                                      # neighbours to become its own organelle; suppresses double seeds on flat tops.
+      temporal_seeding: true         # Use the previous frame's instances to stop split/merge flicker (sequential frames)
+      temporal_split_hysteresis: 2.0 # Splitting an object that was single last frame needs this x seed_min_prominence_um
+      temporal_merge_boundary_ratio: 0.95 # Previously separate objects merge only if the boundary is >= this x dimmer peak (no dip)
+      temporal_merge_boundary_percentile: 90 # Boundary statistic for that test. Synthetic sweep 2026-11-24 (3 seeds): p90@0.95 best
+                                             # (F1 0.86-0.90, crowded 74-82%, touching 70-75/90, true events 2-3/3 each); mean was too strict
 
     # engine: "cellpose" settings
     model_type: "cyto3"         # Stock whole-cell model; or path to a fine-tuned mitochondria model (.pth)
@@ -129,6 +138,9 @@ stage5_tracking_and_mitolandscape:
     allow_track_merging: true   # Mitochondrial Fusion
     merging_max_distance_um: 2.0
     split_merge_max_intensity_ratio: 1.5 # Fission/fusion only if parent/(daughter1+daughter2) mito signal is in [1/1.5, 1.5]
+    min_event_persistence_frames: 3      # Daughters/sources must persist >= N frames; split undone by a merge within N frames = flicker (removed).
+                                         # Synthetic realistic benchmark (2026-11-24): 2 -> 25+38 predicted events, 3 -> 23+32, vs 3+3 true;
+                                         # crowded-region event calls remain unreliable (see manuals/future_task_representative_sample_validation.md)
     min_track_spots: 4          # Keep trajectories present in >= 4 timepoints
 
   snt_autotrace:

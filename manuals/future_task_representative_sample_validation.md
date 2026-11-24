@@ -61,6 +61,21 @@ Decision rule (user, 2026-11-24): keep Cellpose prominently as an option. **If C
 
 **Hypothesis to test (why Cellpose is suspected to fail):** stock `cyto3` is trained on whole cells, which are about 30 px, textured and roundish. Mitochondria here are 2–6 px puncta and short rods, so the model operates far outside its training distribution. It must upsample every slice by about 30/diameter (slow on CPU), and on #39 it missed every punctum along the process (18% coverage, 45% spill). A fine-tuned model or Omnipose may close the gap; GPU access removes the speed objection but not the accuracy one. **Update this section and the README with the real result.**
 
+## Stage 5A fission/fusion validation (added 2026-11-24 after the synthetic benchmark)
+**Why:** on the realistic synthetic benchmark (`scripts/synthetic_benchmark.py`, 30 frames, 54 mitochondria, 3 true fissions + 3 true fusions):
+- every true event was found, but **41 fissions and 44 fusions were predicted**;
+- with the event persistence filter (`min_event_persistence_frames: 3`) there were still 23 fissions and 32 fusions.
+
+The false events come from segmentation flicker among **crowded** mitochondria (< 2 µm apart: only ~61% resolved, versus ~98% of isolated ones). **Fission/fusion rates are therefore the least trustworthy pipeline output until validated on real data.**
+
+**To do on the sample:**
+- A biologist marks true events in 6–8 movies (frame, position), viewing raw `mito_norm` in Fiji; ideally blinded to the pipeline output.
+- Score predicted events: precision and recall, matched within ±1 frame and 2 µm.
+- Stratify by local crowding (nearest-neighbour distance) and by protocol (11.7 s vs 120 s: flicker persistence in frames depends on the frame interval).
+- Re-tune `min_event_persistence_frames` and `split_merge_max_intensity_ratio` per protocol group.
+- Consider reporting events only for isolated objects, or with a per-event confidence.
+- **Until then, interpret event counts as upper bounds and compare conditions only within the same protocol group.**
+
 ## Outputs
 - `validation_sample.csv` (seed, strata, movie list).
 - A per-movie QC table.

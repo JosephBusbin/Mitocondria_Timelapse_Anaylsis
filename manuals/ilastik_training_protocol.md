@@ -80,6 +80,11 @@ Because `preprocess_4d_stack.py` (Module 1) strips out extracellular autofluores
 2. **Use Window Leveling (`t` key) for Display Contrast**:
    * Press **`t`** (or click the Window Leveling icon) and drag the mouse to adjust visual brightness so dim tubules are easy to see. *(Per the ilastik manual, this only adjusts screen display and never alters pixel values.)*
 3. **Follow Strict "Sparse Center & Border" Brush Rules (`Brush Size = 1`)**:
+   * **What you will see when scrolling through Z (user observation, practice Series #39, 2026-11-24):**
+     - Small bright objects appear, move across a few slices and disappear. These are mitochondria passing through the focal planes, because they're 3D objects. Label their **brightest core**.
+     - Near the endfoot they join a large, bright, unmoving patch. Only its **brightest parts** are mitochondria (a dense cluster).
+     - A few slices further, a dim grainy texture fills the **whole cell outline** (soma, process, endfoot) and then fades. That texture is *not* mitochondria. It is leftover cytoplasmic signal and noise that Stage 3 normalisation makes visible, and it is exactly what must be painted as **`Background`**.
+     - Rule of thumb: **Mitochondria = distinct spots and rods clearly brighter than the texture around them** (including dim ones along the process). **Background = the even texture that traces the cell's shape.** If a label would also fit the cell outline, it's Background.
    * **Rule A — Never paint across an entire mitochondrion**: Use **`Brush Size = 1`** and draw a thin 1-pixel line strictly down the **bright core/spine** of 5–8 representative mitochondria (include both bright somatic mitochondria and dimmer shaft rods). If you paint fuzzy outer halos as `Mitochondria`, the classifier will artificially bloat organelle volumes and merge neighbors.
    * **Rule A2 — Cover the full brightness range, not just the brightest cores**: at least half of your `Mitochondria` strokes should be on **dim** mitochondria (in the shaft, deep Z-slices, later frames). Label across **several Z-slices and every loaded frame**, not one plane. Otherwise the Random Forest learns "brighter than X" rather than "shaped like a mitochondrion". The first test classifier had 137 mito voxels painted mostly on saturated cores; its output correlated 0.97 with raw intensity, so it was effectively a threshold.
    * **Rule A3 — Label dim background texture as `Background`**: paint a few strokes on grainy cytoplasm and noise *inside* the cell, not only on empty black space. That is what teaches the classifier noise is not mitochondria.
@@ -108,7 +113,7 @@ Because `preprocess_4d_stack.py` (Module 1) strips out extracellular autofluores
 ---
 
 ### Step 6: Transfer the `.ilp` to SciClone and Verify It Arrived Intact
-Destination: `${MITO_MODELS_DIR}/bestman_mito_2d_v1.ilp`. The default is `/sciclone/data10/<your_wm_username>/mito_pipeline/models/`; on SciClone, run `source scripts/mito_env.bash && echo $MITO_MODELS_DIR` to see the active path.
+Destination: `${MITO_MODELS_DIR}/bestman_mito_2d_v<N>.ilp` (bump the version for every retrain and set `stage4a_ilastik.project_file` in `pipeline_config.yaml`). The default is `/sciclone/data10/<your_wm_username>/mito_pipeline/models/`; on SciClone, run `source scripts/mito_env.bash && echo $MITO_MODELS_DIR` to see the active path.
 
 1. **Record the size and checksum on Windows** (PowerShell):
    ```powershell
@@ -130,6 +135,34 @@ Destination: `${MITO_MODELS_DIR}/bestman_mito_2d_v1.ilp`. The default is `/scicl
    head -c 4 /sciclone/data10/$USER/mito_pipeline/models/bestman_mito_2d_v1.ilp | tail -c 3; echo   # prints HDF
    ```
    `run_pipeline_slurm.bash` and Stage 4A also refuse a missing, empty, or non-HDF5 `.ilp`, so a bad upload fails loudly instead of quietly switching to the fallback estimator.
+
+---
+
+### Step 7: Run the Pre-flight Check (before any cluster run)
+On SciClone, check the uploaded project with ilastik's own Python (it has `h5py`; nothing to install). Pass the training movie's Stage 3 cell mask, so the check can see **where** your Background strokes are:
+```bash
+source scripts/mito_env.bash
+"$MITO_TOOLS_DIR/ilastik-1.4.2-Linux/bin/python" scripts/check_ilastik_project.py \
+    "$MITO_MODELS_DIR/bestman_mito_2d_v3.ilp" \
+    --cell-mask "$MITO_SCRATCH_ROOT/2025/<movie_id>/<movie_id>_cell_mask.tif"
+```
+The project is ready only if the verdict is **READY**. The check covers:
+- ilastik version and workflow;
+- label order (Mitochondria first);
+- that a trained classifier is stored;
+- in-project storage;
+- 2D features;
+- **at least 150 Mitochondria and 300 Background voxels**;
+- **at least 30% of Background voxels inside the cell**.
+
+> **Lesson from `bestman_mito_2d_v2.ilp` (2026-11-24).** It had 15 Mitochondria voxels and 16 Background voxels, and **0% of the Background was inside the cell**. The classifier therefore learned "inside the cell = mitochondria" and called **99.4% of the cell** foreground. Stage 4 then tiled the whole cytoplasm into about 95 fake "mitochondria" per frame, a result that looks stable but is meaningless.
+>
+> Stage 4 now refuses such a map: if more than 50% of the cell is called mitochondria, it stops with exit code 5 and says why (`max_foreground_fraction_of_cell` in `pipeline_config.yaml`). The fix is in the labelling, not the code:
+> - paint Background on the grainy cytoplasm **inside** the soma and process, and in the dim gaps between mitochondria (Rules A3 and B);
+> - paint Mitochondria on dim puncta as well as bright cores (Rule A2);
+> - use 2D features.
+>
+> In the ilastik GUI, a good classifier's prediction layer looks like **sparse puncta and short rods**, not a filled cell outline.
 
 ---
 

@@ -647,3 +647,97 @@ This file serves as persistent local memory for AI agents operating in this repo
     - edits: `run_pipeline_slurm.bash`, `run_hybrid_segmentation.py`, `collect_4d_sld_timelapses.py`, `pipeline_config.yaml` (`hpc_run:`), and a new test class;
     - new files: `merge_collect_shards.py`, `plan_full_run.py`, `submit_full_run.bash`, `aggregate_results.py`, `manuals/full_run_playbook.md`.
     - The main session will not edit those files until it returns, then runs a dress rehearsal on S18/S20/S39.
+
+---
+
+## Session 2026-11-24 (evening) — Orchestration verified, rehearsal, v2 diagnosis, benchmark (Claude Opus 5.5)
+- **User**:
+  - Confirmed the 9 filter rules (the PI will review).
+  - Pushed commits.
+  - Trained v2 `.ilp`.
+  - Asked to check the parallelization subtask, push jobs down the pipeline, set up longer tests while away, catch up on the backlog, then improve manuals/README and test the later stages hard.
+- **Done**:
+  - Subagent orchestration verified (40/40 → 42/42 tests).
+  - Stage hash no longer includes git HEAD.
+  - Rehearsal `rehearsal1` executed end to end (see README).
+  - Config → `bestman_mito_2d_v2.ilp`.
+  - v2 diagnosed as implausible (99.4% of cell; 0% in-cell Background).
+  - Added the exit-5 guard, the `check_ilastik_project.py` checker and manual Step 7.
+  - New `synthetic_benchmark.py` (generator fixed after the first version overlapped truth objects); small and realistic results logged.
+  - Stage 4 parameter sweep (watershed settings insensitive; the earlier recall loss was a generator artifact).
+  - Stage 5A event sweep → persistence filter, default 3.
+  - Future-task doc gained a Stage 5A event validation section.
+- **Jobs**:
+  - Rehearsal: 703831–703834, 703950, 703953, 703956, 703959, 703971.
+  - Benchmarks: 703965, plus realistic seeds 2/3 as 703984/703985 (running).
+  - Guard live test: `/sciclone/scr30/jbusbin/mito_guardtest/` (v2 probabilities kept there for inspection).
+- **Scratch left in place**:
+  - `/sciclone/scr30/jbusbin/mito_rehearsal/`;
+  - `/sciclone/scr30/jbusbin/mito_bench/`;
+  - `/sciclone/scr30/jbusbin/mito_runs/{dryrun_test,subagent_check}`;
+  - `/sciclone/scr30/jbusbin/mito_guardtest/`.
+- **Handoff**:
+  - **The user trains v3** (in-cell Background ≥ 30%, ≥ 150/300 labels, 2D features) and runs the checker.
+  - Then re-run S39 Stages 4–5 (the guard must pass, with plausible occupancy).
+  - Check realistic seeds 2/3.
+  - Event-call reliability is the main open science risk.
+  - Uncommitted: orchestration files, guard, benchmark, checker, docs.
+- **Late update (same session)**:
+  - Realistic seeds 2/3 collapsed (F1 0.12–0.15). Root cause: Stage 3 histogram matching saturated to 65535 (np.interp over the CDF plateau), triggered by a Z-attenuation step that fired on empty or organelle-poor slices.
+  - Fixed both: matching now uses only intensities present in the reference; Z correction is now a cell-channel exponential fit applied as a gain (cap 3×).
+  - After the fixes: S39 20–37 objects/frame (t=5: 70), foreground 2.3%. Synthetic seeds F1 0.84–0.89, isolated ≈100%. 43/43 tests.
+  - Jobs: 703995–703998, 704006–704009.
+  - README restructured (overview, run commands, manuals index, known limits).
+  - **Open:**
+    - v3 ilastik retrain;
+    - late-frame noise (S39 t=5) still visible with the built-in estimator;
+    - event over-calling;
+    - all of this round is uncommitted.
+
+---
+
+## Session 2026-11-24 (night) — ilastik v3, temporal seeding (Option 1) (Claude Opus 5.5)
+- **User**:
+  - Explained the Z-scroll observations (mito → amorphous mass → whole-cell texture) and the realisation that only the brightest structures are mitochondria; asked to note this in the manual.
+  - Approved Option 1 (temporal seeding).
+  - Uploaded v3. Worries about overfitting, and that later frames are messy (mitochondria vanish and reappear), so focus on the cleaner first frames.
+- **Manual**: Rule A gained "What you will see when scrolling through Z" (Mitochondria = distinct spots brighter than the texture; Background = the even texture tracing the cell outline).
+- **v3 `.ilp`** (sha256 303c51bc…):
+  - checker: 2D features PASS, in-cell Background 44% PASS, 58 Mito / 262 Bg voxels (below the 150/300 rule-of-thumb);
+  - config → v3;
+  - S39 Stage 4: foreground 0.4% of cell, 20–41 objects/frame, steady (no last-frame blow-up), 20 tracks;
+  - renders look right (process chain + endfoot cluster, no soma texture);
+  - the saturated endfoot core is left unlabelled (ring) → v4 should label inside it.
+- **Temporal seeding** (`watershed_split_3d_temporal`, config `watershed.temporal_seeding` + `temporal_split_hysteresis` 2.0 + `temporal_merge_boundary_ratio` 0.85 + `temporal_merge_boundary_percentile`):
+  - The A/B (mean-based merge test) on realistic seeds raised crowded recall from 65–74% to 81–84%, touching splits from 56–59 to 71–79 (/90), and link precision by ~0.03; fusions predicted fell 17 → 4–8. But true fusions were lost and precision fell to 0.83–0.85.
+  - Unit test 05f showed the mean boundary test can't detect a real fusion; switched to a percentile.
+  - The p90 sweep restored true events but over-merged (crowded 57–76%, touching ~45/90).
+  - p50/p75/p90@0.95 sweep running (job 704086).
+  - test_09f pinned to independent mode. **44/44 tests pass.**
+- **S39 v3 + temporal**: 21–40 objects/frame, 21 tracks, 0 events (persistence of 3 frames = 6 min at 120 s on a 6-frame movie, so events are near-impossible; protocol-dependent).
+- **Handoff**:
+  - Choose the merge statistic from 704086.
+  - Consider expressing event persistence in seconds rather than frames.
+  - Consider an analysis frame window (user: use the cleaner early frames).
+  - v4 retrain (label the saturated core).
+  - Everything is uncommitted.
+- **Final update + HANDOFF (2026-11-24, night)**:
+  - The merge-statistic sweep (job 704086) chose **p90 @ 0.95** (now the default).
+  - S39 with v3 + temporal (job 704093): 21–39 objects/frame, 21 tracks, 0 fissions / 1 fusion, 2 min 6 s.
+  - 44/44 tests pass. No jobs left running.
+  - The user is committing this round.
+  - **Next steps (priority order):**
+    1. **Event persistence in seconds, not frames**: add `min_event_persistence_s` (e.g. ~35 s → 3 frames at 11.7 s, 2 frames minimum at 120 s); re-run the synthetic sweep.
+    2. **Analysis frame window** (user: the later frames of messy movies lose mitochondria): an optional per-movie or global `analysis_max_frames` / auto-truncate when Stage 4 foreground or object counts collapse; record it in provenance.
+    3. **ilastik v4**: add Mitochondria strokes inside the saturated endfoot core (v3 leaves a ring); more labels (checker wants ≥150/300); train on ≥3 diverse QC-PASS movies once real data arrives.
+    4. Remaining event over-calling (synthetic: ~18–24 predicted vs 6 true): candidate fixes are multi-frame signal conservation and flagging dense clusters as "network" objects; validate on hand-annotated real events (future-task document).
+    5. Optional: compare Cellpose (GPU, hima) again once a fine-tuned mito model exists (future-task document).
+  - **Scratch to clean when convenient** (all re-creatable):
+    - `/sciclone/scr30/jbusbin/mito_bench/` (~15 GB of realistic synthetic movies);
+    - `/sciclone/scr30/jbusbin/mito_rehearsal/`, `/sciclone/scr30/jbusbin/mito_guardtest/`;
+    - `/sciclone/scr30/jbusbin/mito_runs/{dryrun_test,subagent_check}`;
+    - the old `/local/jbusbin/venvs/{tiffio_check,torchres}`.
+  - **Key paths**:
+    - models `/sciclone/data10/jbusbin/mito_pipeline/models/` (v2 kept for reference; config uses v3);
+    - QC PNGs `/sciclone/scr30/jbusbin/mito_qc_png/`;
+    - job scripts `/sciclone/scr30/jbusbin/mito_jobs/` (bench_run.sh, temporal_ab.sh, mergepct_sweep.sh, check_ilp.sh, tests_full.sh).

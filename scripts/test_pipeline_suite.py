@@ -633,6 +633,36 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertLess(np.linalg.norm(np.array(com_t0) - np.array(com_t1)), 0.75)
 
     @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_04b_histogram_matching_never_saturates_and_z_check_ignores_empty_slices(self):
+        """Regression (synthetic seeds 2/3): the brightest voxels must map to the reference's range,
+        never to 65535; and slices that are merely outside the cell must not trigger Z correction."""
+        rng = np.random.default_rng(0)
+        ref = rng.integers(0, 400, size=(64, 64)).astype(np.float32)
+        img = rng.integers(0, 300, size=(64, 64)).astype(np.float32)
+        out = prep_mod.match_histogram_fast_16bit(img, ref)
+        self.assertLessEqual(float(out.max()), float(ref.max()))
+        # Z correction is driven by the cytosolic channel: sparse mito content (bright only in shallow
+        # slices) with an evenly bright cell must NOT trigger; a cell that dims with depth must.
+        mask = np.zeros((16, 64, 64), bool)
+        mask[:, 16:48, 16:48] = True
+        cell_even = np.full((2, 16, 64, 64), 100.0, np.float32)
+        cell_even[:, mask] = 400.0
+        vol = np.zeros((2, 16, 64, 64), np.float32)
+        vol[:, 2:5, 20:30, 20:30] = 3000.0                 # mitochondria only in shallow slices
+        vol[:, :, 16:48, 16:48] += rng.uniform(0, 20, size=(2, 16, 32, 32))
+        before = vol.copy()
+        info = prep_mod.compensate_z_attenuation_inplace(vol, 0.30, cell_4d=cell_even, cell_mask=mask)
+        self.assertFalse(info["applied"])
+        np.testing.assert_array_equal(vol, before)
+        cell_dim = cell_even.copy()
+        for t in range(2):
+            for z in range(16):
+                cell_dim[t, z][mask[z]] = 100.0 + 300.0 * np.exp(-0.08 * z)   # signal above bg decays with depth
+        info2 = prep_mod.compensate_z_attenuation_inplace(vol, 0.30, cell_4d=cell_dim, cell_mask=mask)
+        self.assertTrue(info2["applied"])
+        self.assertAlmostEqual(info2["max_gain_applied"], min(3.0, float(np.exp(0.08 * 15))), delta=0.15)  # capped by max_gain
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_04_fast_16bit_lut_histogram_matching(self):
         """Verifies that 16-bit LUT histogram matching restores bleached intensities accurately."""
         rng = np.random.default_rng(42)
@@ -796,6 +826,64 @@ class TestMito4DPipelineSuite(unittest.TestCase):
             seg_mod.segment_instances(rod_i[None] * 50000, rod_i[None], cfg, calib)
 
     @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_05e_implausible_foreground_guard(self):
+        """A probability map covering most of the cell must be flagged (bad classifier), a sparse one not."""
+        mask = np.zeros((2, 20, 20), dtype=bool)
+        mask[:, 2:18, 2:18] = True
+        whole = np.zeros((3, 2, 20, 20), np.float32)
+        whole[:, :, 2:18, 2:18] = 0.9                      # "everything in the cell is mitochondria"
+        sparse = np.zeros_like(whole)
+        sparse[:, :, 5:8, 5:8] = 0.9
+        self.assertGreater(seg_mod.foreground_fraction_of_cell(whole, mask, 0.5), 0.9)
+        self.assertLess(seg_mod.foreground_fraction_of_cell(sparse, mask, 0.5), 0.1)
+        self.assertEqual(seg_mod.EXIT_IMPLAUSIBLE_FOREGROUND, 5)
+        self.assertLessEqual(
+            self.cfg["stage4_hybrid_segmentation"]["stage4a_ilastik"]["max_foreground_fraction_of_cell"], 0.5)
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_05f_temporal_seeding_keeps_pairs_apart_but_allows_real_fusion(self):
+        """Temporal seeding: two objects separate in the previous frame stay separate when this frame's
+        own seeds would merge them (intensity dip still present), but merge when there is no dip
+        (real fusion); an object that was single is not split by a weak extra peak."""
+        from scipy import ndimage as ndi
+        calib = {"dx_um": 0.19, "dy_um": 0.19, "dz_um": 1.0, "dt_s": 11.7}
+        shape = (5, 30, 50)
+        prev = np.zeros(shape, np.int32)
+        prev[1:4, 12:18, 10:20] = 1
+        prev[1:4, 12:18, 21:31] = 2
+        # Current frame: same pair joined by a neck with a clear intensity dip
+        img = np.zeros(shape, np.float32)
+        img[1:4, 12:18, 10:20] = 1.0
+        img[1:4, 12:18, 21:31] = 1.0
+        img[1:4, 13:17, 20:21] = 0.4
+        inten = ndi.gaussian_filter(img, (0.5, 1.0, 1.0))
+        fg = inten > 0.15
+        self.assertEqual(ndi.label(fg)[1], 1)
+        strong_h = 1.0   # so strong that this frame's own seeds alone give ONE object
+        alone = seg_mod.watershed_split_3d(fg, inten, calib, seed_prominence_um=strong_h)
+        self.assertEqual(len(np.unique(alone[fg])), 1)
+        kept = seg_mod.watershed_split_3d_temporal(fg, inten, calib, prev, seed_prominence_um=strong_h)
+        self.assertEqual(len(np.unique(kept[fg])), 2)
+        # Real fusion: one uniform rod covering both previous objects (no dip) -> merged into one
+        fused = np.zeros(shape, np.float32)
+        fused[0:5, 10:20, 10:31] = 1.0   # realistic thickness: the bright core spans the boundary plane
+        f_int = ndi.gaussian_filter(fused, (0.5, 1.0, 1.0))
+        f_fg = f_int > 0.15
+        merged = seg_mod.watershed_split_3d_temporal(f_fg, f_int, calib, prev, seed_prominence_um=strong_h)
+        self.assertEqual(len(np.unique(merged[f_fg])), 1)
+        # Single object last frame + weak extra peak now -> not split (hysteresis)
+        single_prev = np.where(prev > 0, 1, 0).astype(np.int32)
+        w = np.zeros(shape, np.float32)
+        w[1:4, 12:18, 10:31] = 1.0
+        w[2, 14:16, 25:27] = 1.15   # faint bump
+        w_int = ndi.gaussian_filter(w, (0.5, 1.0, 1.0))
+        w_fg = w_int > 0.15
+        n_plain = len(np.unique(seg_mod.watershed_split_3d(w_fg, w_int, calib)[w_fg]))
+        n_temp = len(np.unique(seg_mod.watershed_split_3d_temporal(w_fg, w_int, calib, single_prev)[w_fg]))
+        self.assertLessEqual(n_temp, n_plain)
+        self.assertEqual(n_temp, 1)
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_05c_instances_gated_by_ilastik_probability(self):
         """Stage 4B drops instances that ilastik does not call mitochondria (mean P below threshold)."""
         masks = np.zeros((1, 20, 20), dtype=np.int32)
@@ -810,9 +898,10 @@ class TestMito4DPipelineSuite(unittest.TestCase):
     @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_06_sparse_lap_tracking_gap_fission_fusion(self):
         """Verifies gap closing, track splitting (fission), merging (fusion), and TrackMate v7 XML validity."""
-        # Create a 5-frame label stack (T=5, Z=6, Y=64, X=64)
-        labels = np.zeros((5, 6, 64, 64), dtype=np.uint16)
-        norm = np.full((5, 6, 64, 64), 10000, dtype=np.uint16)
+        # Create a 6-frame label stack (T=6, Z=6, Y=64, X=64); daughters persist 3 frames (T=3..5),
+        # as required by min_event_persistence_frames: 3
+        labels = np.zeros((6, 6, 64, 64), dtype=np.uint16)
+        norm = np.full((6, 6, 64, 64), 10000, dtype=np.uint16)
 
         # Track 1: Present at T=0, missing at T=1 (gap!), present at T=2, splits into two at T=3 and T=4.
         # The parent (6x3 = 18 voxels) is twice a daughter (3x3 = 9), so the split conserves signal.
@@ -824,6 +913,8 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         labels[3, 3, 15:18, 10:13] = 2
         labels[4, 3, 8:11, 10:13] = 1
         labels[4, 3, 16:19, 10:13] = 2
+        labels[5, 3, 7:10, 10:13] = 1
+        labels[5, 3, 17:20, 10:13] = 2
 
         lbl_path = self.tmp_dir / "gap_split_mito_labels.tif"
         norm_path = self.tmp_dir / "gap_split_mito_norm.tif"
@@ -835,9 +926,9 @@ class TestMito4DPipelineSuite(unittest.TestCase):
             lbl_path, norm_path, self.tmp_dir, "gap_split", self.cfg, calib
         )
 
-        # All 6 detections belong to 1 unified branched lineage tree with 1 gap-close and 1 fission!
+        # All 8 detections belong to 1 unified branched lineage tree with 1 gap-close and 1 fission!
         self.assertEqual(n_tr, 1)
-        self.assertEqual(n_sp, 6)
+        self.assertEqual(n_sp, 8)
         self.assertEqual(n_fiss, 1)
 
         # Verify TrackMate XML parses cleanly and has <AllSpots> and <AllTracks>
@@ -845,6 +936,25 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         root = xml_tree.getroot()
         self.assertIsNotNone(root.find(".//AllSpots"))
         self.assertIsNotNone(root.find(".//AllTracks"))
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
+    def test_06c_transient_flicker_events_removed(self):
+        """A split immediately undone by a merge (segmentation flicker) must not count as fission + fusion."""
+        spots = {i: {"ID": i, "FRAME": f} for i, f in enumerate([0, 1, 1, 2, 3, 4, 5])}
+        # 0 -> 1 (link) ; 0 -> 2 (split at t=1) ; 2 -> 3 (merge back at t=2) ; 1 -> 3 -> 4 -> 5 -> 6 (links)
+        edges = [
+            {"SPOT_SOURCE_ID": 0, "SPOT_TARGET_ID": 1, "EVENT_TYPE": "FRAME_LINK"},
+            {"SPOT_SOURCE_ID": 0, "SPOT_TARGET_ID": 2, "EVENT_TYPE": "SPLIT_FISSION"},
+            {"SPOT_SOURCE_ID": 2, "SPOT_TARGET_ID": 3, "EVENT_TYPE": "MERGE_FUSION"},
+            {"SPOT_SOURCE_ID": 1, "SPOT_TARGET_ID": 3, "EVENT_TYPE": "FRAME_LINK"},
+            {"SPOT_SOURCE_ID": 3, "SPOT_TARGET_ID": 4, "EVENT_TYPE": "FRAME_LINK"},
+            {"SPOT_SOURCE_ID": 4, "SPOT_TARGET_ID": 5, "EVENT_TYPE": "FRAME_LINK"},
+            {"SPOT_SOURCE_ID": 5, "SPOT_TARGET_ID": 6, "EVENT_TYPE": "FRAME_LINK"},
+        ]
+        kept, n = track_mod.filter_transient_events(edges, spots, 3)
+        self.assertEqual(n, 2)
+        self.assertFalse([e for e in kept if e["EVENT_TYPE"] in ("SPLIT_FISSION", "MERGE_FUSION")])
+        self.assertEqual(len(kept), 5)
 
     @unittest.skipUnless(HAVE_HPC_PACKAGES, HPC_SKIP_MSG)
     def test_06b_unconserved_appearance_is_not_fission(self):
@@ -1027,6 +1137,495 @@ class TestMito4DPipelineSuite(unittest.TestCase):
         self.assertEqual(len(moves), 2 * (n_t - 1))
         self.assertLess(moves[n_t - 2], 0.15)                  # static rod: ~0 um per frame
         self.assertAlmostEqual(moves[-1], 0.48, delta=0.12)    # moving rod: 3 px x 0.16 um
+
+
+class TestFullRunOrchestration(unittest.TestCase):
+    """
+    Full-archive orchestration (submit_full_run.bash, plan_full_run.py, merge_collect_shards.py, the
+    collector's --shard, stage-done markers in run_pipeline_slurm.bash, parallel watershed).
+    Standard-library tests run anywhere; the marker and watershed tests need pyyaml / numpy+skimage.
+    """
+
+    # Fake showinf: every .sld holds one qualifying 4D series and one 2D projection.
+    FAKE_OME = (
+        '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+        '<Image ID="Image:0" Name="cell_t1"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint16" '
+        'SizeX="64" SizeY="48" SizeZ="20" SizeC="2" SizeT="12" PhysicalSizeX="0.16" PhysicalSizeY="0.16" '
+        'PhysicalSizeZ="1.0" TimeIncrement="11.7"/></Image>'
+        '<Image ID="Image:1" Name="cell_t1 MAX"><Pixels ID="Pixels:1" DimensionOrder="XYCZT" Type="uint16" '
+        'SizeX="64" SizeY="48" SizeZ="1" SizeC="2" SizeT="1"/></Image></OME>'
+    )
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="mito_fullrun_test_"))
+        import plan_full_run
+        import merge_collect_shards
+        self.plan = plan_full_run
+        self.merge = merge_collect_shards
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ---------------------------------------------------------------- helpers
+    def _fake_bftools(self) -> Path:
+        bft = self.tmp / "bft"
+        bft.mkdir()
+        for tool in ("showinf", "bfconvert"):
+            (bft / tool).write_text(
+                "#!/bin/sh\n"
+                'case "$*" in *-version*) echo "Version: fake"; exit 0;; esac\n'
+                f"cat <<'XML'\n{self.FAKE_OME}\nXML\n"
+            )
+            (bft / tool).chmod(0o755)
+        return bft
+
+    def _sld_tree(self) -> Path:
+        src = self.tmp / "src"
+        names = ["2024/a_cell1.sld", "2024/b_cell2.sld", "2024/sub dir/c.sld", "2025/d.sld", "2025/e.sldy",
+                 "2025/f.sld", "2025/g.sld", "2025/~lock.sld"]
+        for n in names:
+            p = src / n
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"\x01" * 70_000)
+        (src / "2025" / "stub.sld").write_bytes(b"\x01" * 10)  # SKIPPED_STUB
+        return src
+
+    def _collect(self, src: Path, out: Path, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "collect_4d_sld_timelapses.py"), str(src), str(out),
+             "--mode", "scan-only", "--workers", "1", "--bftools-dir", str(self.bft),
+             "--hpc-raw-root", "/raw/root", *extra],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            env={**os.environ, "MITO_PLASMID_CSV": ""},
+        )
+
+    # ---------------------------------------------------------------- tests
+    def test_09a_shard_partition_covers_every_file_exactly_once(self):
+        """--shard K/N: the N shards are disjoint and together cover every candidate exactly once."""
+        files = [Path(f"/data/{i:03d}.sld") for i in range(23)]
+        for n in (1, 2, 5, 7, 23, 30):
+            shards = [sld_mod.select_shard(files, k, n) for k in range(1, n + 1)]
+            flat = [p for s in shards for p in s]
+            self.assertEqual(sorted(flat), files, f"N={n}")
+            self.assertEqual(len(flat), len(set(flat)), f"N={n}")
+        self.assertEqual(sld_mod.parse_shard_spec("3/20"), (3, 20))
+        self.assertIsNone(sld_mod.parse_shard_spec(None))
+        for bad in ("0/5", "6/5", "a/b", "3", "1/0"):
+            with self.assertRaises(ValueError):
+                sld_mod.parse_shard_spec(bad)
+        self.assertEqual(sld_mod.shard_report_name("sld_4d_inventory.csv", "_shard3"), "sld_4d_inventory_shard3.csv")
+        self.assertEqual(sld_mod.shard_report_name("extracted_checksums.sha256", ""), "extracted_checksums.sha256")
+
+    def test_09b_sharded_scan_merge_round_trip(self):
+        """Sharded scan + merge_collect_shards reproduces the unsharded inventory, health audit, movie lists
+        and mito classification byte for byte; duplicates and missing shards are refused."""
+        if sys.platform.startswith("win"):
+            self.skipTest("Fake showinf shell script requires a POSIX shell")
+        self.bft = self._fake_bftools()
+        src = self._sld_tree()
+        plasmids = self.tmp / "plasmids.csv"
+        plasmids.write_text(
+            "s,sequenced? (date),does this plasmid make FP positive cells?,glycerol stock?,-20 DNA duplicate?,"
+            "addgene submission?,plasmid ID,name (Prom_GOI_3'),gateway compnent?,localization sequence?,"
+            "GOI? tag?,Fluorescent Protein 1 (ME),Fluorescent Protein 2 (3'),p2a,\"uas, MCS, promoter?\","
+            "antibiotic,plasmid description/elements,full map?,long term use,Forward Primer,Reverse Primer,"
+            "product size \n,,,,,,JR19,pUAS-mlsEGFPpA,,mito,,EGFP,,,UAS,amp,,,,,,\n", encoding="utf-8")
+        filt = ["--plasmid-csv", str(plasmids), "--mito-filter", "report"]
+        ref = self.tmp / "ref"
+        proc = self._collect(src, ref, *filt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        shard_dir = self.tmp / "shards"
+        n = 3
+        for k in range(1, n + 1):
+            proc = self._collect(src, shard_dir, "--shard", f"{k}/{n}", *filt)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue((shard_dir / f"sld_4d_inventory_shard{k}.csv").exists())
+            self.assertTrue((shard_dir / f"mito_classification_shard{k}.csv").exists())
+        self.assertFalse((shard_dir / "sld_4d_inventory.csv").exists())  # no unsuffixed clobbering
+        merged = self.tmp / "merged"
+        rc, summary = self.merge.run_merge(shard_dir, merged)
+        self.assertEqual(rc, 0, summary)
+        self.assertEqual(summary["shards_missing"], [])
+        for name in ("sld_4d_inventory.csv", "sld_health_audit.csv", "movie_list.txt", "movie_list_2024.txt",
+                     "movie_list_2025.txt", "mito_classification.csv", "mito_review.csv"):
+            self.assertEqual((merged / name).read_bytes(), (ref / name).read_bytes(), name)
+        self.assertEqual(len((merged / "movie_list.txt").read_text().splitlines()), 7)
+        prov_ref = json.loads((ref / "extraction_provenance.json").read_text())["summary_metrics"]
+        prov_m = json.loads((merged / "extraction_provenance.json").read_text())["summary_metrics"]
+        for key in ("total_sld_candidates_found", "total_sld_files_scanned", "total_unparseable_or_skipped",
+                    "total_series_inspected", "qualifying_4d_series_count", "cohorts_discovered"):
+            self.assertEqual(prov_m[key], prov_ref[key], key)
+
+        # --file-list: the same files, listed explicitly (relative to source_dir), give the same inventory
+        flist = self.tmp / "files.txt"
+        flist.write_text("\n".join(sorted(p.relative_to(src).as_posix() for p in src.rglob("*.sld*"))) + "\n")
+        via_list = self.tmp / "via_list"
+        proc = self._collect(src, via_list, "--file-list", str(flist), *filt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((via_list / "sld_4d_inventory.csv").read_bytes(), (ref / "sld_4d_inventory.csv").read_bytes())
+
+        # A missing shard -> exit 3 (unless allowed); a duplicated shard -> refused
+        (shard_dir / "extraction_provenance_shard2.json").rename(self.tmp / "p2.json")
+        rc, summary = self.merge.run_merge(shard_dir, self.tmp / "m2", expected_shards=3)
+        self.assertEqual((rc, summary["shards_missing"]), (3, [2]))
+        self.assertEqual(self.merge.run_merge(shard_dir, self.tmp / "m3", 3, allow_missing=True)[0], 0)
+        (self.tmp / "p2.json").rename(shard_dir / "extraction_provenance_shard2.json")
+        shutil.copy(shard_dir / "sld_4d_inventory_shard1.csv", shard_dir / "sld_4d_inventory_shard4.csv")
+        with self.assertRaises(self.merge.MergeConflict):
+            self.merge.run_merge(shard_dir, self.tmp / "m4")
+
+    def test_09c_size_classes_and_resource_model(self):
+        """Size-class binning, the memory/time model seeded from the 2026-11-24 measurements, request
+        rounding, throttles (20% cap) and canary selection."""
+        p = self.plan
+        hpc = p.load_hpc_run(REPO_ROOT / "pipeline_config.yaml")
+        if _installed("yaml"):
+            import yaml
+            with open(REPO_ROOT / "pipeline_config.yaml", encoding="utf-8") as f:
+                self.assertEqual(p.deep_merge(p.DEFAULT_HPC_RUN, yaml.safe_load(f)["hpc_run"]), hpc)
+        model, cls = hpc["model"], hpc["size_classes"]
+        self.assertEqual([p.size_class(g, cls["edges_gb"], cls["names"]) for g in (0.5, 1.99, 2.0, 7.9, 8.0, 50)],
+                         ["S", "S", "M", "M", "L", "L"])
+        s39 = p.Movie(entry="x", path="/r/2025/S39.ome.tif", gb=1.38, size_t=6, size_c=2, size_source="inventory")
+        mem, sec = p.predict_stage3(s39, model)
+        self.assertAlmostEqual(mem, 2.75 * 1.38 + 0.5)                 # S39 measured 3.5 GB peak
+        self.assertAlmostEqual(sec, 65 * 1.38)                          # ~90 s measured
+        self.assertEqual(p.to_request(mem, sec, model), (7, 10))        # 4.3 GB x1.5 -> 7 GB; 10 min floor
+        big = p.Movie(entry="y", path="/r/2025/big.ome.tif", gb=20.0, size_t=30, size_c=2, size_source="inventory")
+        self.assertEqual(p.to_request(*p.predict_stage3(big, model), model), (84, 44))  # 55.5 GB, 1300 s
+        mem45, sec45 = p.predict_stage45(s39, model, cpus=4)
+        chan = 1.38 / 2
+        self.assertAlmostEqual(sec45, 290 * chan + 74 * chan * 2 / 6 + 60)  # ilastik + 2 watershed rounds + Stage 5
+        self.assertAlmostEqual(mem45, 2.75 * 1.38 + 1.5 + 4 * 8.0 * chan / 6)
+        # ilastik speed-up saturates at 4 threads: 8 cpus is no faster for ilastik than 4
+        import math
+        il = lambda c: p.predict_stage45(big, model, cpus=c)[1] - 74 * 10 * math.ceil(30 / min(c, 30)) / 30 - 60  # noqa: E731
+        self.assertAlmostEqual(il(8), il(4))
+        self.assertAlmostEqual(il(1), 4 * il(4))
+        self.assertEqual(p.fmt_time(44), "00:44:00")
+        self.assertEqual(p.fmt_time(1500), "1-01:00:00")
+        self.assertEqual(p.parse_time_to_min("1-01:00:00"), 1500)
+        self.assertEqual((p.cap_tasks(900, 0.2, 1), p.cap_tasks(900, 0.2, 4), p.cap_tasks(128, 0.2, 1)), (180, 45, 25))
+        self.assertEqual(p.split_throttle(180, [300, 40]), [158, 21])
+        self.assertEqual(p.split_throttle(180, [5, 3]), [5, 3])
+        self.assertEqual([len(c) for c in p.chunk(list(range(2500)), 1000)], [1000, 1000, 500])
+        movies = ([p.Movie("s", f"/r/s{i}", 1.0 + i / 100, 10, 2, "inventory", size_class="S") for i in range(30)]
+                  + [p.Movie("m", f"/r/m{i}", 4.0 + i, 10, 2, "inventory", size_class="M") for i in range(8)]
+                  + [p.Movie("l", f"/r/l{i}", 20.0 + i, 10, 2, "inventory", size_class="L") for i in range(2)])
+        canary = p.select_canary(movies, 10)
+        self.assertEqual(len(canary), 10)
+        self.assertEqual({m.size_class for m in canary}, {"S", "M", "L"})
+        self.assertIn("/r/l1", [m.path for m in canary])       # largest movie of a class always included
+        self.assertIn("/r/s29", [m.path for m in canary])
+        # sacct parsing, retry selection (QC exit 3 never retried) and --array index compression
+        sacct = ("100_1|COMPLETED|0:0|00:01:30|\n100_1.batch|COMPLETED|0:0|00:01:30|3438.28M\n"
+                 "100_2|OUT_OF_MEMORY|0:125|00:00:40|\n100_2.batch|OUT_OF_MEMORY|0:125|00:00:40|7000M\n"
+                 "100_3|FAILED|3:0|00:01:00|\n100_4|TIMEOUT|0:0|00:10:00|\n100_5|FAILED|1:0|00:00:05|\n")
+        tasks = p.parse_sacct(sacct)
+        self.assertAlmostEqual(tasks[("100", 1)]["maxrss_mb"], 3438.28)
+        self.assertEqual(tasks[("100", 1)]["elapsed_s"], 90)
+        states = p.latest_task_states({"job_id": "100", "retries": []}, sacct)
+        self.assertEqual(p.retry_indices("stage3", states), [2, 4, 5])
+        self.assertEqual(p.compress_indices([1, 2, 3, 7, 9, 10]), "1-3,7,9-10")
+
+    def test_09d_done_markers_skip_and_rerun_on_config_change(self):
+        """Stage hashes are chained: a Stage 4 config change re-runs 4 and 5 but not 3; comment edits re-run
+        nothing; a new .ilp re-runs 4-5; a new input re-runs everything. Markers match only their hash."""
+        p = self.plan
+        cfg = self.tmp / "cfg.yaml"
+        text = (REPO_ROOT / "pipeline_config.yaml").read_text(encoding="utf-8")
+        cfg.write_text(text, encoding="utf-8")
+        movie = self.tmp / "m.ome.tif"
+        movie.write_bytes(b"x" * 100)
+        h0 = p.compute_stage_hashes(cfg, REPO_ROOT, movie, None, head="abc")
+        marker = self.tmp / "m_stage3.done"
+        p.write_marker(marker, h0[3], 3, {"job": "1_1"})
+        self.assertTrue(p.marker_matches(marker, h0[3]))
+        self.assertFalse(p.marker_matches(marker, h0[4]))
+        self.assertFalse(p.marker_matches(self.tmp / "absent.done", h0[3]))
+
+        cfg.write_text(text.replace("max_frame_gap: 2", "max_frame_gap: 2   # comment edit only"), encoding="utf-8")
+        self.assertEqual(p.compute_stage_hashes(cfg, REPO_ROOT, movie, None, head="abc"), h0)
+        cfg.write_text(text.replace("seed_min_separation_xy_um: 0.4", "seed_min_separation_xy_um: 0.5"), encoding="utf-8")
+        h4 = p.compute_stage_hashes(cfg, REPO_ROOT, movie, None, head="abc")
+        self.assertEqual(h4[3], h0[3])
+        self.assertNotEqual(h4[4], h0[4])
+        self.assertNotEqual(h4[5], h0[5])
+        cfg.write_text(text.replace("linking_max_distance_um: 2.5", "linking_max_distance_um: 3.0"), encoding="utf-8")
+        h5 = p.compute_stage_hashes(cfg, REPO_ROOT, movie, None, head="abc")
+        self.assertEqual((h5[3], h5[4]), (h0[3], h0[4]))
+        self.assertNotEqual(h5[5], h0[5])
+        cfg.write_text(text.replace("min_contrast_sigma: 3.0", "min_contrast_sigma: 2.0"), encoding="utf-8")
+        h3 = p.compute_stage_hashes(cfg, REPO_ROOT, movie, None, head="abc")
+        self.assertTrue(all(h3[s] != h0[s] for s in (3, 4, 5)))
+        cfg.write_text(text, encoding="utf-8")
+        ilp = self.tmp / "model.ilp"
+        ilp.write_bytes(b"\x89HDF\r\n\x1a\n" + b"\0" * 32)
+        hi = p.compute_stage_hashes(cfg, REPO_ROOT, movie, ilp, head="abc")
+        self.assertEqual(hi[3], h0[3])
+        self.assertNotEqual(hi[4], h0[4])
+        self.assertNotEqual(p.compute_stage_hashes(cfg, REPO_ROOT, movie, None, head="def")[3], h0[3])
+        movie.write_bytes(b"x" * 101)
+        self.assertNotEqual(p.compute_stage_hashes(cfg, REPO_ROOT, movie, None, head="abc")[3], h0[3])
+
+    @unittest.skipUnless(_installed("yaml") and not sys.platform.startswith("win"), "Requires pyyaml and bash")
+    def test_09e_slurm_script_markers_skip_rerun_and_qc_gate(self):
+        """run_pipeline_slurm.bash with fake stage scripts: a second run is a no-op, a Stage 4 config change
+        re-runs only 4-5, Stage 4-5 alone after a QC-failed Stage 3 exits 3, TMPDIR is under scr30-style
+        MITO_SCRATCH_ROOT/tmp and is removed afterwards."""
+        repo = self.tmp / "repo"
+        (repo / "scripts").mkdir(parents=True)
+        for name in ("run_pipeline_slurm.bash", "plan_full_run.py", "pipeline_config_io.py", "mito_env.bash", "tiff_io.py"):
+            shutil.copy(SCRIPT_DIR / name, repo / "scripts" / name)
+        cfg_text = (REPO_ROOT / "pipeline_config.yaml").read_text(encoding="utf-8")
+        (repo / "pipeline_config.yaml").write_text(cfg_text, encoding="utf-8")
+        log = self.tmp / "stages.log"
+        fake = (
+            "import argparse, os, sys, pathlib\n"
+            "ap = argparse.ArgumentParser(); ap.add_argument('--config'); ap.add_argument('--input')\n"
+            "ap.add_argument('--movie-id'); ap.add_argument('--work-dir'); a = ap.parse_args()\n"
+            "wd = pathlib.Path(a.work_dir); mid = a.movie_id or pathlib.Path(a.input).name.split('.')[0]\n"
+            "open(os.environ['FAKE_LOG'], 'a').write('{stage} ' + os.environ.get('TMPDIR', '') + '\\n')\n"
+            "for suffix in {outputs}: (wd / (mid + suffix)).write_text('x')\n"
+            "qc = os.environ.get('FAKE_QC_FAIL') == '1' and '{stage}' == '3'\n"
+            "if '{stage}' == '3': (wd / (mid + '_provenance.json')).write_text("
+            "'{{\"stage3_preprocessing_metrics\": {{\"qc_status\": \"' + ('FAIL_NO_SIGNAL' if qc else 'PASS') + '\"}}}}')\n"
+            "sys.exit(3 if qc else 0)\n"
+        )
+        for script, stage, outputs in (
+            ("preprocess_4d_stack.py", "3", ["_mito_norm.tif", "_cell_RFP_reg.tif", "_cell_mask.tif"]),
+            ("run_hybrid_segmentation.py", "4", ["_mito_labels.tif", "_Probabilities.tif"]),
+            ("run_trackmate_sparse_lap.py", "5A", ["_tracks.csv"]),
+            ("run_arbor_and_mitolandscape.py", "5B", ["_process_0.5um_profile.csv"]),
+        ):
+            (repo / "scripts" / script).write_text(fake.format(stage=stage, outputs=outputs))
+        tools = self.tmp / "data" / "tools"
+        tools.mkdir(parents=True)
+        (tools / "activate_mito4d.sh").write_text("# test: no venv\n")
+        raw = self.tmp / "data" / "raw_ometiff" / "2025"
+        raw.mkdir(parents=True)
+        movies = []
+        for i in (1, 2):
+            mv = raw / f"movie{i}.ome.tif"
+            mv.write_bytes(b"\0" * 1000)
+            movies.append(mv)
+        lst = self.tmp / "list.txt"
+        lst.write_text("\n".join(str(m) for m in movies) + "\n")
+        scratch = self.tmp / "scr30" / "mito_work"
+        env = {**os.environ, "MITO_REPO_DIR": str(repo), "MITO_DATA_ROOT": str(self.tmp / "data"),
+               "MITO_SCRATCH_ROOT": str(scratch), "MITO_TOOLS_DIR": str(tools), "MITO_RAW_ROOT": str(raw.parent),
+               "MITO_MODELS_DIR": str(self.tmp / "models"), "MITO_OUTPUT_ROOT": str(self.tmp / "out"),
+               "MITO_ALLOW_ILASTIK_FALLBACK": "1", "FAKE_LOG": str(log), "SLURM_JOB_ID": "777",
+               "SLURM_ARRAY_JOB_ID": "777", "SLURM_CPUS_PER_TASK": "1", "MITO_STAGES": "3,4,5",
+               # the script's 'python3' must be this interpreter (the one that has pyyaml)
+               "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}"}
+        for k in ("MITO_ILASTIK_BIN", "MITO_IGNORE_QC"):
+            env.pop(k, None)
+
+        def run(task: int, *args: str, **extra: str) -> subprocess.CompletedProcess:
+            log.write_text("")
+            return subprocess.run(
+                ["bash", str(repo / "scripts" / "run_pipeline_slurm.bash"), str(repo / "pipeline_config.yaml"),
+                 str(lst), *args], env={**env, "SLURM_ARRAY_TASK_ID": str(task), **extra},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, cwd=str(self.tmp))
+
+        def stages_run() -> list:
+            return [line.split()[0] for line in log.read_text().splitlines()]
+
+        r = run(1, "--keep-intermediates")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(stages_run(), ["3", "4", "5A", "5B"])
+        tmpdirs = {line.split()[1] for line in log.read_text().splitlines()}
+        self.assertEqual(tmpdirs, {str(scratch / "tmp" / "777_1")})
+        self.assertFalse((scratch / "tmp" / "777_1").exists())        # removed by the EXIT trap
+        work = scratch / "2025" / "movie1"
+        for s in (3, 4, 5):
+            self.assertTrue((work / f"movie1_stage{s}.done").exists())
+        r = run(1, "--keep-intermediates")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(stages_run(), [])                              # second invocation: no-op
+        (repo / "pipeline_config.yaml").write_text(
+            cfg_text.replace("seed_min_separation_xy_um: 0.4", "seed_min_separation_xy_um: 0.5"), encoding="utf-8")
+        r = run(1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(stages_run(), ["4", "5A", "5B"])               # Stage 3 still valid
+        self.assertFalse((work / "movie1_mito_norm.tif").exists())     # complete -> intermediates cleaned
+        r = run(1)
+        self.assertEqual((r.returncode, stages_run()), (0, []))          # still a no-op after cleanup
+        r = run(1, "--force", "--stages", "3")
+        self.assertEqual((r.returncode, stages_run()), (0, ["3"]))       # --force regenerates training data
+        # Movie 2: Stage 3 fails QC -> exit 3, no marker; a later Stage 4-5 job also exits 3
+        r = run(2, "--stages", "3", FAKE_QC_FAIL="1")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertFalse((scratch / "2025" / "movie2" / "movie2_stage3.done").exists())
+        r = run(2, "--stages", "4,5")
+        self.assertEqual((r.returncode, stages_run()), (3, []))
+
+    @unittest.skipUnless(HAVE_HPC_PACKAGES and _installed("skimage"), HPC_SKIP_MSG)
+    def test_09f_parallel_watershed_equals_serial(self):
+        """Watershed frames run in a process pool (n_workers > 1) give labels identical to the serial loop
+        and to the previous full-frame implementation."""
+        from scipy import ndimage as ndi
+        calib = {"dx_um": 0.19, "dy_um": 0.19, "dz_um": 1.0, "dt_s": 120.0}
+        n_t, shape = 5, (6, 48, 64)
+        rng = np.random.default_rng(7)
+        vol = np.zeros((n_t,) + shape, np.float32)
+        for t in range(n_t):
+            for k in range(4):
+                z, y, x = 2 + k % 2, 8 + 9 * k, 6 + 10 * k + 2 * t
+                vol[t, z:z + 2, y:y + 5, x:x + 8] = 1.0
+                vol[t, z:z + 2, y + 1:y + 4, x + 8:x + 11] = 0.6   # touching neighbour
+            vol[t] = ndi.gaussian_filter(vol[t], (0.5, 1.0, 1.0)) + rng.normal(0, 0.01, shape)
+        vol[3] = 0.0                                               # one empty frame
+        prob = np.clip(vol, 0, 1).astype(np.float32)
+        mito = (prob * 50000).astype(np.uint16)
+        cfg = seg_mod.load_config(REPO_ROOT / "pipeline_config.yaml")
+        # This test covers the frame-INDEPENDENT mode; temporal seeding (default) is sequential by design
+        cfg["stage4_hybrid_segmentation"]["stage4b_instance_segmentation"].setdefault("watershed", {})["temporal_seeding"] = False
+        serial, used = seg_mod.segment_instances(mito, prob, cfg, calib, n_workers=1)
+        parallel, _ = seg_mod.segment_instances(mito, prob, cfg, calib, n_workers=3)
+        self.assertEqual(used, "watershed")
+        self.assertEqual(parallel.dtype, serial.dtype)
+        self.assertTrue(np.array_equal(serial, parallel))
+        self.assertGreater(int(serial.max()), 3)
+        self.assertEqual(int(serial[3].max()), 0)
+        # Reference: the pre-parallel loop (watershed + gate + relabel on the FULL frame)
+        b = cfg["stage4_hybrid_segmentation"]["stage4b_instance_segmentation"]
+        voxel = calib["dx_um"] * calib["dy_um"] * calib["dz_um"]
+        min_vox = max(2, int(round(float(b["min_volume_um3"]) / voxel)))
+        margin = int(round(2 * float(b["diameter_px"])))
+        for t in range(n_t):
+            fg = prob[t] > float(b["foreground_probability_threshold"])
+            ref = np.zeros(shape, np.uint16)
+            if fg.any():
+                zs, ys, xs = (np.flatnonzero(fg.any(axis=ax)) for ax in ((1, 2), (0, 2), (0, 1)))
+                box = (slice(max(0, zs[0] - 1), min(shape[0], zs[-1] + 2)),
+                       slice(max(0, ys[0] - margin), min(shape[1], ys[-1] + 1 + margin)),
+                       slice(max(0, xs[0] - margin), min(shape[2], xs[-1] + 1 + margin)))
+                full = np.zeros(shape, np.int32)
+                full[box] = seg_mod.watershed_split_3d(fg[box], mito[t][box], calib)
+                full = seg_mod.gate_instances_by_probability(full, prob[t], float(b["min_object_mean_probability"]))
+                ref, _ = seg_mod.filter_and_relabel_fast(full, min_vox)
+            self.assertTrue(np.array_equal(ref, serial[t]), f"frame {t}")
+        self.assertEqual(seg_mod.watershed_worker_count(2, 8), 2)
+        self.assertGreaterEqual(seg_mod.watershed_worker_count(10, None), 1)
+
+    @unittest.skipIf(sys.platform.startswith("win"), "submit_full_run.bash requires bash")
+    def test_09g_submit_dry_run_prints_dependency_chain_and_throttles(self):
+        """Dry run of every phase prints afterany (merge, Stage 3 after canary, aggregate), afterok (extract),
+        aftercorr + kill-on-invalid-dep (Stages 4-5), the 20% / I/O throttles, hima GPU-node exclusion and
+        chunking - and never calls sbatch (a fake sbatch on PATH fails the test if it is called)."""
+        fakebin = self.tmp / "bin"
+        fakebin.mkdir()
+        called = self.tmp / "sbatch_called.txt"
+        (fakebin / "sbatch").write_text(f'#!/bin/sh\necho "$@" >> "{called}"\nexit 1\n')
+        nodes_batch = "\n".join(f"bo{i:02d}|20|128000|bora,bo|(null)" for i in range(45))
+        nodes_hima = "\n".join([f"hi0{i}|32|257000|hima,hi,hi0{i}|(null)" for i in (1, 2, 3, 6)]
+                               + [f"hi0{i}|32|257000|hima,hi,gpu,p100,hi0{i}|gpu:p100:1" for i in (4, 5, 7)])
+        (fakebin / "sinfo").write_text(
+            "#!/bin/sh\ncase \"$*\" in\n"
+            f"  *hima*) cat <<'E'\n{nodes_hima}\nE\n;;\n"
+            f"  *) cat <<'E'\n{nodes_batch}\nE\n;;\nesac\n")
+        (fakebin / "squeue").write_text("#!/bin/sh\nexit 0\n")           # nothing is in the queue
+        (fakebin / "sacct").write_text(f'#!/bin/sh\ncat "{self.tmp}/sacct.txt" 2>/dev/null\n')
+        for tool in ("sbatch", "sinfo", "squeue", "sacct"):
+            (fakebin / tool).chmod(0o755)
+        cfg = self.tmp / "cfg.yaml"
+        cfg.write_text((REPO_ROOT / "pipeline_config.yaml").read_text(encoding="utf-8")
+                       .replace("max_array_size: 1000", "max_array_size: 200"), encoding="utf-8")
+        # 120 .sld files; 343 movies: 300 S (1 GB), 40 M (4 GB), 3 L (20 GB)
+        src = self.tmp / "sld"
+        src.mkdir()
+        for i in range(120):
+            (src / f"f{i:03d}.sld").write_bytes(b"")
+        raw = self.tmp / "raw"
+        (raw / "2025").mkdir(parents=True)
+        rows, entries = [], []
+        for cls, n, gb in (("s", 300, 1.0), ("m", 40, 4.0), ("l", 3, 20.0)):
+            for i in range(n):
+                rel = f"2025/{cls}{i:03d}.ome.tif"
+                (raw / rel).write_bytes(b"")
+                entries.append(str(raw / rel))
+                rows.append({"cohort_year": "2025", "sld_path": f"{src}/f{i % 120:03d}.sld", "series_index": str(i),
+                             "size_t": "10", "size_c": "2", "estimated_uncompressed_gb": str(gb),
+                             "is_4d_timelapse": "True", "extracted_ometiff_relpath": rel,
+                             "mito_label": "MITO" if i % 10 else "REVIEW"})
+        inv = self.tmp / "inv.csv"
+        with open(inv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        movie_list = self.tmp / "movie_list.txt"
+        movie_list.write_text("\n".join(entries) + "\n")
+        env = {**os.environ, "PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
+               "MITO_DATA_ROOT": str(self.tmp / "data"), "MITO_SCRATCH_ROOT": str(self.tmp / "scr" / "mito_work"),
+               "MITO_RAW_ROOT": str(raw), "MITO_MODELS_DIR": str(self.tmp / "models"), "USER": "tester"}
+        for k in ("MITO_OUTPUT_ROOT", "MITO_TOOLS_DIR", "MITO_RUN_ID", "MITO_REPO_DIR"):
+            env.pop(k, None)
+
+        def submit(*args: str) -> str:
+            proc = subprocess.run(["bash", str(SCRIPT_DIR / "submit_full_run.bash"), *args, "--run-id", "t1",
+                                   "--no-module", "--config", str(cfg)],
+                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc.stdout
+
+        pre = "mito_t1"
+        out = submit("scan", "--source-dir", str(src), "--chain-extract")
+        self.assertIn("--array=1-24%20", out)                                # 120 files / 5 per shard, scan %20
+        self.assertIn(f"--dependency=afterany:DRY_{pre}_scan", out)          # merge after every shard
+        self.assertIn(f"--dependency=afterok:DRY_{pre}_merge", out)          # extract only after a clean merge
+        self.assertIn("--array=1-120%20", out)                               # extract %20 (I/O throttle)
+        self.assertIn(f"--dependency=afterany:DRY_{pre}_extract", out)
+
+        run_dir = self.tmp / "scr" / "mito_runs" / "t1"
+        (run_dir / "scan" / "merged").mkdir(parents=True)
+        shutil.copy(inv, run_dir / "scan" / "merged" / "sld_4d_inventory.csv")
+        out = submit("extract", "--source-dir", str(src))
+        self.assertIn("--array=1-108%20", out)                                # only files with a MITO series
+
+        out = submit("canary", "--movie-list", str(movie_list), "--inventory", str(inv))
+        self.assertIn(f"--job-name={pre}_canary_L_c1", out)
+        self.assertIn("--partition=hima", out)
+        self.assertIn("--exclude=hi04,hi05,hi07", out)                       # never the GPU nodes
+        canary_lists = sorted((run_dir / "dryrun" / "lists").glob("canary_*.txt"))
+        self.assertEqual(sum(len(p.read_text().split()) for p in canary_lists), 10)
+
+        out = submit("stage3", "--movie-list", str(movie_list), "--inventory", str(inv))
+        self.assertIn("308 movie(s) found", out)                             # MITO only: 35 REVIEW movies excluded
+        for name, array in (("stage3_S_c1", "1-200%"), ("stage3_S_c2", "1-70%"), ("stage3_M_c1", "1-36%"),
+                            ("stage3_L_c1", "1-2%")):
+            self.assertIn(f"--job-name={pre}_{name}", out)
+            self.assertIn(f"--array={array}", out)
+        self.assertIn("cap 20% -> 180 concurrent 1-core task(s)", out)       # 45 x 20 cores
+        self.assertIn("cap 20% -> 25 concurrent 1-core task(s)", out)        # hima CPU nodes only: 128 cores
+        self.assertIn("--array=1-200%117", out)                              # 180 shared: 200/306
+        self.assertIn(f"--dependency=afterany:DRY_{pre}_canary_", out)
+
+        out = submit("stage45", "--allow-fallback")
+        for cls in ("S_c1", "S_c2", "M_c1", "L_c1"):
+            self.assertIn(f"--dependency=aftercorr:DRY_{pre}_stage3_{cls}", out)
+        self.assertIn("--kill-on-invalid-dep=yes", out)
+        self.assertIn("--cpus-per-task=4", out)
+        self.assertIn("ArrayTaskThrottle=", out)        # Stage 3 still holds the cap -> raise later
+        self.assertIn("MITO_ALLOW_ILASTIK_FALLBACK=1", out)
+
+        out = submit("aggregate")
+        dep = next(line for line in out.splitlines() if "--dependency=afterany:" in line)
+        for cls in ("S_c1", "S_c2", "M_c1", "L_c1"):
+            self.assertIn(f"DRY_{pre}_stage45_{cls}", dep)
+
+        # Canary refit: pretend the canary ran (real job id, now finished) and feed its sacct numbers.
+        man_path = run_dir / "dryrun" / "run_manifest.json"
+        man = json.loads(man_path.read_text())
+        s_canary = next(n for n in man["jobs"] if n.endswith("canary_S_c1"))
+        man["jobs"][s_canary]["job_id"] = "555"
+        man_path.write_text(json.dumps(man))
+        (self.tmp / "sacct.txt").write_text("555_1|COMPLETED|0:0|00:03:00|\n555_1.batch|COMPLETED|0:0|00:03:00|9000M\n")
+        out = submit("stage3", "--movie-list", str(movie_list), "--inventory", str(inv))
+        self.assertIn("model refit from 1 canary task(s)", out.replace("\n# ", " "))
+        self.assertIn("dropped: no longer in the queue", out)              # finished canary id not used as dep
+        self.assertFalse(called.exists(), "sbatch must never be called in a dry run")
 
 
 def ndimage_com(vol) -> Tuple[float, float, float]:

@@ -3,24 +3,60 @@ Image analysis pipeline for in vivo rapid 3D timelapse imaging of albino Xenopus
 
 ---
 
-## Running on SciClone (quick reference)
+## Pipeline at a glance
 
-Run everything from `dev.sciclone.wm.edu`. Heavy work goes to compute nodes through Slurm. Load the cluster module in every new shell.
+| Stage | Where | What it does | Script |
+|---|---|---|---|
+| 0. Construct filter | lab PC / SciClone | Classifies files by name (`mls`, lab plasmid IDs, common mito markers) → `MITO` / `MITO_PHOTOACTIVATABLE` / `NOT_MITO` / `REVIEW`, with mito colour | `scripts/construct_classifier.py` |
+| 1–2. Scan + extract | SciClone (sharded arrays) | Health-audits `.sld` files, finds 4D series, extracts LZW OME-TIFF with checksums | `scripts/collect_4d_sld_timelapses.py` |
+| 3. Preprocess | SciClone, 1 core | Drift registration (background-subtracted phase correlation), cell mask (glow-subtracted Triangle), **raw-signal QC (exit 3 = no mito signal)**, haze removal then gating, depth gain from the cell channel, bleach matching, normalisation | `scripts/preprocess_4d_stack.py` |
+| 4A. Foreground | SciClone, 4 cores | ilastik Pixel Classification, headless → probability map; **exit 5 if it covers > 50% of the cell** (bad classifier) | `scripts/run_hybrid_segmentation.py` |
+| 4B. Instances | same job | Splits **touching mitochondria**: seeded 3D watershed (default) or Cellpose (`engine: cellpose`, GPU on hima) | same |
+| 5A. Tracking | same job | LAP linking, gap closing, fission/fusion with signal conservation + event persistence filter | `scripts/run_trackmate_sparse_lap.py` |
+| 5B. Profiling | same job | Soma/process/endfoot compartments, internal geodesic distance, morphology, 0.5 µm profiles | `scripts/run_arbor_and_mitolandscape.py` |
+| Aggregate | 1 job | Cohort tables, QC dashboard, failure list | `scripts/aggregate_results.py` |
+
+## Running on SciClone
+
+Run everything from `dev.sciclone.wm.edu` (never a login node). Heavy work goes through Slurm; run `module load slurm/bora` in every shell. The Python environment only works on compute nodes.
 
 ```bash
-module load slurm/bora                      # makes sinfo/squeue/sbatch/srun target bora
-source scripts/mito_env.bash                # storage paths; override with: export MITO_DATA_ROOT=...
-# one-time install (≈15 min, ~4.2 GB under $MITO_TOOLS_DIR); refuses to run on dev itself
-srun -p batch -N1 -c4 --mem=16G -t 01:00:00 bash scripts/setup_hpc_env.bash
-# Stage 3 only (ilastik training data; keeps *_mito_norm.tif in $MITO_SCRATCH_ROOT)
-sbatch --array=1-N%15 scripts/run_pipeline_slurm.bash pipeline_config.yaml "$MITO_RAW_ROOT/movie_list.txt" --stages 3
-# full pipeline (needs $MITO_MODELS_DIR/bestman_mito_2d_v1.ilp)
-sbatch --array=1-N%15 scripts/run_pipeline_slurm.bash pipeline_config.yaml "$MITO_RAW_ROOT/movie_list.txt"
-squeue -u $USER; sacct -j <jobid> --format=JobID,State,Elapsed,MaxRSS
+module load slurm/bora
+source scripts/mito_env.bash                          # storage paths (change MITO_DATA_ROOT for lab storage)
+srun -p batch -N1 -c4 --mem=16G -t 01:00:00 bash scripts/setup_hpc_env.bash      # one-time install
+srun -p hima --gres=gpu:1 -c4 --mem=32G -t 01:00:00 bash scripts/setup_gpu_env.bash   # optional: GPU Cellpose env
+
+# Whole archive: dry-run every phase first, then add --execute (manual: manuals/full_run_playbook.md)
+bash scripts/submit_full_run.bash scan   --run-id RUN --source-dir <raw .sld dir> --plasmid-csv <plasmid table> --chain-extract
+bash scripts/submit_full_run.bash canary --run-id RUN
+bash scripts/submit_full_run.bash stage3 --run-id RUN
+#   human gate: retrain ilastik on canary QC-PASS movies; check it with scripts/check_ilastik_project.py
+bash scripts/submit_full_run.bash stage45   --run-id RUN
+bash scripts/submit_full_run.bash aggregate --run-id RUN
+bash scripts/submit_full_run.bash status    --run-id RUN --execute
 ```
 
-- Storage defaults to `/sciclone/data10/$USER/mito_pipeline`. To move to shared lab storage, change only `MITO_DATA_ROOT`.
-- The Python environment works only on compute nodes, because its interpreter path exists there but not on dev. Use `srun` for interactive work: `srun --pty -c4 --mem=16G -t 1:00:00 bash`, then `source $MITO_TOOLS_DIR/activate_mito4d.sh`.
+Exit codes worth knowing:
+- **3**: Stage 3 found no mito signal (a result, not retried).
+- **5**: the Stage 4 foreground is implausible, so retrain ilastik (not retried).
+- **4**: extraction failure in shard mode.
+
+Every stage writes a `.done` marker keyed to its config, code and `.ilp`, so re-submitting only redoes what changed.
+
+## Manuals and tools
+- `manuals/full_run_playbook.md`: data transfer (Globus), phases, checks, retry, etiquette (≤ 20% of bora).
+- `manuals/windows_lab_extraction_guide.md`: lab PC setup and extraction options (including the construct filter).
+- `manuals/construct_filter_guide.md`: the filename filter, review CSV and overrides.
+- `manuals/ilastik_training_protocol.md`: training rules (in-cell Background!) and the pre-flight check (Step 7).
+- `manuals/future_task_representative_sample_validation.md`: the planned validation on a random sample of real data, including watershed vs Cellpose and fission/fusion validation.
+- QC and testing tools:
+  - `scripts/qc_pipeline_outputs.py`: per-stage QC report.
+  - `scripts/synthetic_benchmark.py`: ground-truth benchmark.
+  - `scripts/check_ilastik_project.py`: `.ilp` pre-flight check.
+  - `scripts/test_pipeline_suite.py`: 43 tests; run on a compute node.
+- Known limits (2026-11-24):
+  - Fission/fusion counts are over-called in crowded regions (synthetic: about 15 predicted vs 3 true per type), so treat them as upper bounds until validated.
+  - The only real test movie with signal so far is practice Series #39.
 
 ---
 
@@ -206,3 +242,51 @@ squeue -u $USER; sacct -j <jobid> --format=JobID,State,Elapsed,MaxRSS
   - With h-maxima seeds, #39 frame 0 gives 37 objects (previously 103 with the old nearest-seed partition). Endfoot overlay: `/sciclone/scr30/jbusbin/mito_qc_png/endfoot_ws_S39_t0.png`.
   - **Future task:** `manuals/future_task_representative_sample_validation.md`, a stratified random sample of the real archive. It includes a watershed vs Cellpose (stock and fine-tuned, GPU) comparison on hand-annotated touching mitochondria. The user approved removing Cellpose if it fails there.
   - Also updated `mitochondria_hpc_pipeline_plan.md` (Phase 4 status + Checkpoint 4), `pipeline_agent_spec.md` and `manuals/ilastik_training_protocol.md`.
+- **2026-11-24 (Claude Opus 5.5, evening)**: full-run orchestration, dress rehearsal, ilastik v2 diagnosis, ground-truth benchmark, Stage 4/5 guards.
+  - **User actions:** committed and pushed (c0981b7, 18e5d0a); confirmed the 9 filter rules (the PI will review `mito_review.csv`); trained and uploaded `bestman_mito_2d_v2.ilp` on S39 frames 0/2/5.
+  - **Parallel full-run orchestration** (subagent-built, verified in the main session):
+    - new `scripts/submit_full_run.bash` (phases `scan`/`merge`/`extract`/`canary`/`stage3`/`stage45`/`aggregate`/`retry`/`status`/`overflow`; dry-run by default, `--execute` to submit);
+    - new `scripts/plan_full_run.py` (size classes, resource model with canary refit, throttles at 20% of the live partition, stage hashes);
+    - new `scripts/merge_collect_shards.py` and `scripts/aggregate_results.py`; new `manuals/full_run_playbook.md`;
+    - collector `--shard K/N`, `--file-list`, `--report-dir`;
+    - `run_pipeline_slurm.bash`: per-stage `.done` markers, `TMPDIR` on scratch (bora `/local` is the 10 GB root fs), 1-CPU default;
+    - watershed frames run in parallel.
+    - Main-session change: stage hashes no longer include the git HEAD (any commit would have re-run every movie); the script sha256 still covers code changes.
+  - **Dress rehearsal** on the practice `.sld` (run `rehearsal1`, `/sciclone/scr30/jbusbin/mito_rehearsal/`):
+    - scan → merge → extract (3 series, 12 min) → canary (S18/S20 QC exit 3, S39 PASS) → stage3 (S39 skipped by its marker in 1 s; model refit memory ×1.47, time ×2.2) → stage45 (`aftercorr`; S18/S20 cancelled; S39 4 min 11 s, 12.3 GB) → aggregate;
+    - outputs: `failures.csv` lists both QC failures with contrast; tables of 321 spots, 60 tracks, 16 events; protocol tag `dt120.0_dz1.00_dxy0.188`;
+    - re-running stage45 was a no-op (2 s per task).
+  - **ilastik v2 is not usable:** 15 Mitochondria / 16 Background label voxels, **0% of Background inside the cell**, 3D features. It calls **99.4% of the cell** foreground, so Stage 4 tiled the cytoplasm into ~95 fake objects per frame (built-in estimator: 2.1%). Fixes:
+    - new **Stage 4 guard**: exit **5** `FAIL_IMPLAUSIBLE_FOREGROUND` when P>0.5 covers > 50% of the cell (`max_foreground_fraction_of_cell`); never retried; reported in status, `failures.csv` and the playbook;
+    - new **`scripts/check_ilastik_project.py`** pre-flight checker (label counts, in-cell Background via `--cell-mask`, 2D features, storage, label order); manual Step 7 and the v2 lesson added.
+    - **The user should train v3.**
+  - **New `scripts/synthetic_benchmark.py`:** a ground-truth generator and evaluator for Stages 3–5 (radial-glia cell, drift, bleach, noise; stationary/motile/touching/fission/fusion mitochondria; registered truth). Results:
+    - Small preset, 3 seeds: Stage 4 F1 0.88–0.96; **isolated objects 145/145**; crowded ~75%.
+    - Realistic preset (30 × 49 × 664 × 952, 3.7 GB): **3.3 min per movie** (Stage 3 153 s, Stage 4 31 s, Stage 5 13 s), 11 GB peak; isolated 98%, crowded 61%, touching pairs 52/90; links R/P 0.90/0.85, displacement error 0.17 µm; compartments 0.86.
+    - **Events: 3/3 fissions and 3/3 fusions found but 41 + 44 predicted.**
+  - **Stage 5A:** new event persistence filter (`filter_transient_events`, `min_event_persistence_frames: 3`) removes transient and flicker split-merge pairs (realistic benchmark: 85 → 55 predicted events). **Crowded-region event calls remain unreliable**; validation was added to the future-task document.
+  - Tests: 05e (foreground guard), 06c (flicker filter), test_06 extended to 6 frames, `TestFullRunOrchestration` 09a–09g. **42/42 pass on bora.**
+- **2026-11-24 (Claude Opus 5.5, late)**: two Stage 3 bugs found by the synthetic benchmark (seeds 2/3 collapsed to F1 0.12–0.15) and fixed.
+  1. `match_histogram_fast_16bit` interpolated over the reference CDF's plateau above its maximum, so each image's brightest voxels mapped to **65535**. This affects bleach matching in every movie. It now interpolates only over intensities present in the reference.
+  2. **Depth (Z) attenuation correction rewritten.** The old version histogram-matched every slice to a bright one, which fired when slices were outside the cell or simply had no mitochondria, and stretched noise to mitochondria brightness (#39 briefly gave ~1,200 objects/frame). It now fits the **cytosolic channel's** in-cell signal against depth (exponential) and applies a smooth gain capped at `max_gain` 3.0 only if the fitted drop is > 30%. #39: drop 0.825 → gain 3.0; 20–37 objects/frame (70 at t=5), foreground 2.3% of cell.
+  - After the fixes, the realistic synthetic seeds 1–3 give: F1 0.84 / 0.89 / 0.88; isolated objects 524/524, 580/581, 642/650; links R ≈ 0.96, P 0.89–0.93; compartments 0.97–0.99; ~3.4 min per 3.7 GB movie.
+  - Test 04b (no saturation; Z correction ignores organelle content and follows the cell channel). **43/43 pass.**
+  - README quick reference replaced by "Pipeline at a glance / Running / Manuals and tools".
+- **2026-11-24 (Claude Opus 5.5, night)**: ilastik v3 and temporal seeding.
+  - **User**: trained `bestman_mito_2d_v3.ilp` (2D features, 44% in-cell Background; 58/262 label voxels). On S39 it calls 0.4% of the cell foreground and gives 20–41 objects/frame, steady. Renders show the process chain + endfoot cluster with no soma texture. The saturated endfoot core is unlabelled, so v4 should add strokes inside it. Config → v3. The manual gained the user's Z-scroll observations (Mitochondria = distinct spots brighter than the texture; Background = the texture tracing the cell outline).
+  - **Temporal seeding** (Stage 4B, default on: `watershed.temporal_seeding`), new `watershed_split_3d_temporal`:
+    - frames are segmented in order; objects that were separate in the previous frame are kept apart unless no intensity dip separates them (90th percentile of the boundary ≥ 0.95 × the dimmer peak);
+    - an object that was single needs a 2× more prominent peak to split.
+    - Tuned on the realistic synthetic benchmark, 3 seeds, off → on:
+      - F1 0.84–0.89 → 0.86–0.90;
+      - crowded recall 65–74% → 74–82%;
+      - touching pairs split 56–59 → 70–75 (/90);
+      - link precision 0.89–0.93 → 0.93–0.95;
+      - false-event load ~31 → 18–24 predicted (6 true);
+      - true events still found (2–3/3 per type).
+    - Stage 4 becomes sequential (~2–3 min instead of 0.5 min per realistic movie).
+    - Tests 05f (keep apart / real fusion / no weak split) and 09f (pinned to independent mode). **44/44 pass.**
+  - **Open**:
+    - event persistence counted in frames is protocol-dependent (3 frames = 6 min at 120 s), so consider seconds;
+    - consider an analysis frame window (the user prefers the cleaner early frames);
+    - event calls still over-predict about 3–4× on synthetic data.

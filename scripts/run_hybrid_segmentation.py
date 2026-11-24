@@ -218,6 +218,134 @@ def watershed_split_3d(
     return labels
 
 
+def watershed_split_3d_temporal(
+    binary_3d: np.ndarray,
+    intensity_3d: np.ndarray,
+    calib: Dict[str, float],
+    prev_labels: Optional[np.ndarray],
+    seed_sep_xy_um: float = 0.4,
+    seed_sep_z_um: float = 1.0,
+    seed_prominence_um: float = 0.05,
+    split_hysteresis: float = 2.0,
+    merge_boundary_ratio: float = 0.95,
+    min_overlap_voxels: int = 3,
+    merge_boundary_percentile: float = 90.0,
+) -> np.ndarray:
+    """
+    Seeded 3D watershed that uses the PREVIOUS frame's instances (already registered to the same
+    coordinates by Stage 3) to suppress frame-to-frame segmentation flicker between touching
+    mitochondria, which otherwise shows up downstream as fake fission/fusion pairs.
+
+    Per foreground component C of this frame:
+      - C overlaps >= 2 previous objects but this frame's own seeds would give fewer: the previous
+        objects become the markers (keep them apart). Afterwards each adjacent pair is merged back
+        only if there is no intensity dip between them (90th percentile of the boundary intensity >=
+        merge_boundary_ratio x the dimmer of the two peaks) -> real fusions are still allowed.
+      - C overlaps exactly 1 previous object but this frame's seeds would split it: re-seed C with
+        split_hysteresis x seed_prominence_um (a split must be clearly stronger than the noise of
+        the previous frame's single object) -> real fissions with a clear gap are still allowed.
+      - otherwise (no overlap, e.g. fast movers or new objects): independent seeds, as in
+        watershed_split_3d.
+    With prev_labels None this is exactly watershed_split_3d.
+    """
+    from skimage.morphology import h_maxima
+    from skimage.segmentation import watershed
+
+    binary_3d = np.asarray(binary_3d, dtype=bool)
+    if prev_labels is None or not np.any(prev_labels) or not np.any(binary_3d):
+        return watershed_split_3d(binary_3d, intensity_3d, calib, seed_sep_xy_um, seed_sep_z_um, seed_prominence_um)
+    dz, dy, dx = calib["dz_um"], calib["dy_um"], calib["dx_um"]
+    edt = ndimage.distance_transform_edt(binary_3d, sampling=(dz, dy, dx))
+    inten = ndimage.gaussian_filter(intensity_3d.astype(np.float32), sigma=(0.5, 1.0, 1.0))
+    inten_norm = inten / max(1e-6, float(inten[binary_3d].max()))
+    elevation = (edt * (0.5 + 0.5 * inten_norm)).astype(np.float32)
+
+    rz = max(0, int(round(0.5 * seed_sep_z_um / dz)))
+    ry = max(1, int(round(0.5 * seed_sep_xy_um / dy)))
+    rx = max(1, int(round(0.5 * seed_sep_xy_um / dx)))
+    zz, yy, xx = np.ogrid[-rz : rz + 1, -ry : ry + 1, -rx : rx + 1]
+    footprint = (zz / max(rz, 0.5)) ** 2 + (yy / ry) ** 2 + (xx / rx) ** 2 <= 1.0
+
+    def seeds(h: float, region: np.ndarray) -> np.ndarray:
+        pk = h_maxima(np.where(region, elevation, 0.0).astype(np.float32), h).astype(bool) & region
+        lab, _ = ndimage.label(ndimage.binary_dilation(pk, structure=footprint) & region)
+        return lab.astype(np.int32)
+
+    base = seeds(seed_prominence_um, binary_3d)
+    comps, n_comp = ndimage.label(binary_3d)
+    markers = np.zeros_like(base)
+    next_id = 1
+    keep_apart = []  # (component id, list of marker ids seeded from the previous frame)
+    objs = ndimage.find_objects(comps)
+    for ci, sl in enumerate(objs, start=1):
+        if sl is None:
+            continue
+        cmask = comps[sl] == ci
+        prev_sub = prev_labels[sl][cmask]
+        ids, cnt = np.unique(prev_sub[prev_sub > 0], return_counts=True)
+        prev_ids = ids[cnt >= min_overlap_voxels]
+        own = np.unique(base[sl][cmask])
+        own = own[own > 0]
+        msub = markers[sl]
+        if len(prev_ids) >= 2 and len(own) < len(prev_ids):
+            ids_here = []
+            for pid in prev_ids:
+                m = cmask & (prev_labels[sl] == pid)
+                if m.any():
+                    msub[m] = next_id
+                    ids_here.append(next_id)
+                    next_id += 1
+            keep_apart.append((ci, ids_here))
+            continue
+        if len(prev_ids) == 1 and len(own) > 1:
+            region = np.zeros_like(binary_3d)
+            region[sl] = cmask
+            strict = seeds(split_hysteresis * seed_prominence_um, region)[sl]
+            src = strict
+        else:
+            src = base[sl]
+        for oid in np.unique(src[cmask]):
+            if oid == 0:
+                continue
+            msub[cmask & (src == oid)] = next_id
+            next_id += 1
+    labels = watershed(-elevation, markers, mask=binary_3d).astype(np.int32)
+
+    # Allow real fusions: merge previous-frame-seeded neighbours with no intensity dip between them.
+    struct = ndimage.generate_binary_structure(3, 1)
+    for ci, ids_here in keep_apart:
+        sl = objs[ci - 1]
+        sub = labels[sl]
+        isub = inten[sl]
+        changed = True
+        while changed and len(ids_here) > 1:
+            changed = False
+            for i in range(len(ids_here)):
+                for j in range(i + 1, len(ids_here)):
+                    a, b = ids_here[i], ids_here[j]
+                    ma, mb = sub == a, sub == b
+                    if not ma.any() or not mb.any():
+                        continue
+                    border = (ndimage.binary_dilation(ma, structure=struct) & mb) | (ndimage.binary_dilation(mb, structure=struct) & ma)
+                    if not border.any():
+                        continue
+                    # A real dip means even the brightest part of the shared boundary is dimmer than both
+                    # peaks; the boundary's mean would be dragged down by the objects' dim outer edges.
+                    if float(np.percentile(isub[border], merge_boundary_percentile)) >= merge_boundary_ratio * min(float(isub[ma].max()), float(isub[mb].max())):
+                        sub[mb] = a
+                        ids_here.pop(j)
+                        changed = True
+                        break
+                if changed:
+                    break
+
+    rest = binary_3d & (labels == 0)
+    if rest.any():
+        rest_lab, _ = ndimage.label(rest)
+        labels[rest] = rest_lab[rest] + int(labels.max())
+    return labels
+
+
 def filter_and_relabel_fast(masks_t: np.ndarray, min_voxels: int) -> Tuple[np.ndarray, int]:
     """
     Vectorized O(N) volume filtering and sequential relabeling (1..K) using np.bincount
@@ -240,6 +368,22 @@ def filter_and_relabel_fast(masks_t: np.ndarray, min_voxels: int) -> Tuple[np.nd
     lut = np.zeros(len(counts), dtype=np.uint16)
     lut[valid_mask] = np.arange(1, num_valid + 1, dtype=np.uint16)
     return lut[masks_t], num_valid
+
+
+EXIT_IMPLAUSIBLE_FOREGROUND = 5  # run_pipeline_slurm/plan_full_run: not retried (retrain ilastik instead)
+
+
+def foreground_fraction_of_cell(prob_map: np.ndarray, cell_mask: np.ndarray, threshold: float) -> float:
+    """Median over frames of the fraction of cell-mask voxels with P > threshold.
+
+    Mitochondria fill a minority of the cytoplasm. A classifier that calls most of the cell
+    "mitochondria" (e.g. trained with Background strokes only outside the cell) would make Stage 4B
+    tile the whole cytoplasm into fake instances (seen with bestman_mito_2d_v2.ilp: 99% of the cell).
+    """
+    mask = np.asarray(cell_mask, dtype=bool)
+    if not mask.any():
+        return 0.0
+    return float(np.median([(prob_map[t] > threshold)[mask].mean() for t in range(prob_map.shape[0])]))
 
 
 def gate_instances_by_probability(masks: np.ndarray, prob: np.ndarray, min_mean_p: float) -> np.ndarray:
@@ -368,6 +512,30 @@ def segment_instances(
                          seed_xy, seed_z, seed_h, min_mean_p, min_voxels))
             boxes.append(box)
             frames.append(t)
+        temporal = bool(ws_cfg.get("temporal_seeding", True))
+        if temporal:
+            # Frames depend on the previous frame's instances -> sequential (still seconds per frame).
+            print("[STAGE 4B] Temporal seeding ON: previous-frame instances stabilise splits/merges.")
+            prev_full = None
+            done = {}
+            for (t, box, job) in zip(frames, boxes, jobs):
+                fg_box, inten_box, prob_box = job[0], job[1], job[2]
+                prev_box = prev_full[box] if prev_full is not None else None
+                masks_box = watershed_split_3d_temporal(
+                    fg_box, inten_box, calib, prev_box,
+                    seed_sep_xy_um=seed_xy, seed_sep_z_um=seed_z, seed_prominence_um=seed_h,
+                    split_hysteresis=float(ws_cfg.get("temporal_split_hysteresis", 2.0)),
+                    merge_boundary_ratio=float(ws_cfg.get("temporal_merge_boundary_ratio", 0.95)),
+                    merge_boundary_percentile=float(ws_cfg.get("temporal_merge_boundary_percentile", 90.0)),
+                )
+                masks_box = gate_instances_by_probability(masks_box, prob_box, min_mean_p)
+                relabeled_box, count_t = filter_and_relabel_fast(masks_box, min_voxels)
+                labels_4d[t][box] = relabeled_box
+                prev_full = labels_4d[t]
+                done[t] = count_t
+            for t in frames:
+                print(f"  [T={t+1}/{n_t}] Segmented {done[t]} mitochondrial instances (>= {min_vol_um3} um^3).")
+            return labels_4d, engine_used
         workers = watershed_worker_count(len(jobs), n_workers)
         if workers > 1:
             from concurrent.futures import ProcessPoolExecutor
@@ -527,6 +695,31 @@ def main() -> int:
         )
         prob_map = fallback_foreground_probability(mito_norm, target_max)
     write_tiff(prob_out_path, prob_map.astype(np.float32), metadata=calib)
+
+    # Plausibility guard: stop before segmenting if the foreground covers most of the cell.
+    s4_cfg = cfg.get("stage4_hybrid_segmentation", {})
+    fg_thr = float(s4_cfg.get("stage4b_instance_segmentation", {}).get("foreground_probability_threshold", 0.5))
+    max_frac = float(s4_cfg.get("stage4a_ilastik", {}).get("max_foreground_fraction_of_cell", 0.5))
+    mask_path = args.work_dir / f"{args.movie_id}_cell_mask.tif"
+    if mask_path.exists():
+        cell_mask_raw, _ = read_tiff(mask_path)
+        cell_mask = np.asarray(cell_mask_raw).reshape(mito_norm.shape[1:]) > 0
+        frac = foreground_fraction_of_cell(prob_map, cell_mask, fg_thr)
+        prov["stage4a_foreground_fraction_of_cell"] = round(frac, 4)
+        print(f"[STAGE 4A] Foreground (P > {fg_thr}) covers {100 * frac:.1f}% of the cell mask "
+              f"(source: {stage4a_source}; limit {100 * max_frac:.0f}%).")
+        if frac > max_frac and os.environ.get("MITO_ALLOW_IMPLAUSIBLE_FOREGROUND", "0") != "1":
+            prov["stage4_status"] = "FAIL_IMPLAUSIBLE_FOREGROUND"
+            with open(prov_path, "w", encoding="utf-8") as f:
+                json.dump(prov, f, indent=2)
+            print(
+                f"[ERROR] {args.movie_id}: {100 * frac:.1f}% of the cell is called mitochondria (> {100 * max_frac:.0f}%). "
+                "The foreground model is implausible (for ilastik: retrain with Background strokes on in-cell "
+                "texture and between mitochondria). Probabilities kept for inspection: "
+                f"{prob_out_path.name}. Override: MITO_ALLOW_IMPLAUSIBLE_FOREGROUND=1.",
+                file=sys.stderr,
+            )
+            return EXIT_IMPLAUSIBLE_FOREGROUND
 
     labels_4d, engine_used = segment_instances(mito_norm, prob_map, cfg, calib, fg_channel_idx=fg_idx)
 

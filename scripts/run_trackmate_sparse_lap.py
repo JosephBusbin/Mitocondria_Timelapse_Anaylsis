@@ -203,6 +203,64 @@ def write_trackmate_xml(
         f.write("</TrackMate>\n")
 
 
+def filter_transient_events(
+    edges: List[Dict[str, Any]], spot_lut: Dict[int, Dict[str, Any]], min_persist: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Removes split/merge edges that do not persist:
+      - SPLIT_FISSION P -> C: the daughter branch starting at C must span >= min_persist frames
+        (following FRAME_LINK/GAP_CLOSE successors), and so must the parent's other continuation.
+      - MERGE_FUSION B -> M: the source branch ending at B must span >= min_persist frames
+        backwards, and the product branch from M >= min_persist frames forwards.
+      - Flicker: a split P -> C at frame t followed within min_persist frames by a merge from C's
+        branch back into P's continuation is removed together with that merge.
+    Branch lengths are counted in frames (gap-closed links count their frame difference).
+    """
+    succ: Dict[int, int] = {}
+    pred: Dict[int, int] = {}
+    for e in edges:
+        if e["EVENT_TYPE"] in ("FRAME_LINK", "GAP_CLOSE"):
+            succ[e["SPOT_SOURCE_ID"]] = e["SPOT_TARGET_ID"]
+            pred[e["SPOT_TARGET_ID"]] = e["SPOT_SOURCE_ID"]
+
+    def chain(start: int, nxt: Dict[int, int], limit: int = 10_000) -> List[int]:
+        out = [start]
+        while out[-1] in nxt and len(out) < limit:
+            out.append(nxt[out[-1]])
+        return out
+
+    def span_frames(ids: List[int]) -> int:
+        frames = [spot_lut[i]["FRAME"] for i in ids]
+        return max(frames) - min(frames) + 1
+
+    drop = set()
+    splits = [k for k, e in enumerate(edges) if e["EVENT_TYPE"] == "SPLIT_FISSION"]
+    merges = [k for k, e in enumerate(edges) if e["EVENT_TYPE"] == "MERGE_FUSION"]
+    for k in splits:
+        par, child = edges[k]["SPOT_SOURCE_ID"], edges[k]["SPOT_TARGET_ID"]
+        child_branch = chain(child, succ)
+        other = succ.get(par)
+        if span_frames(child_branch) < min_persist or other is None or span_frames(chain(other, succ)) < min_persist:
+            drop.add(k)
+            continue
+        # flicker: a later merge from the child's branch into the parent's continuation, soon after
+        t_split = spot_lut[child]["FRAME"]
+        cont = set(chain(other, succ))
+        branch = set(child_branch)
+        for m in merges:
+            src, tgt = edges[m]["SPOT_SOURCE_ID"], edges[m]["SPOT_TARGET_ID"]
+            if src in branch and tgt in cont and spot_lut[tgt]["FRAME"] - t_split <= min_persist:
+                drop.update((k, m))
+    for m in merges:
+        if m in drop:
+            continue
+        src, prod = edges[m]["SPOT_SOURCE_ID"], edges[m]["SPOT_TARGET_ID"]
+        if span_frames(chain(src, pred)) < min_persist or span_frames(chain(prod, succ)) < min_persist:
+            drop.add(m)
+    kept = [e for k, e in enumerate(edges) if k not in drop]
+    return kept, len(drop)
+
+
 def run_sparse_lap_tracking(
     labels_path: Path,
     norm_path: Path,
@@ -234,6 +292,9 @@ def run_sparse_lap_tracking(
     min_track_spots = int(t_cfg.get("min_track_spots", 4))
     # Max allowed parent/(daughter1 + daughter2) signal ratio (and its inverse) for split/merge events
     max_ratio = max(1.0 + 1e-6, float(t_cfg.get("split_merge_max_intensity_ratio", 1.5)))
+    # Event persistence: daughters (fission) / sources (fusion) must exist this many frames, and a
+    # split undone by a merge of the same branches within this window is cancelled as flicker.
+    min_persist = int(t_cfg.get("min_event_persistence_frames", 2))
 
     # 1. Fast Bounding-Box Spot Extraction
     print(f"[{movie_id}] Extracting 3D spots via fast bounding-box slicing across {n_t} frames...")
@@ -406,6 +467,19 @@ def run_sparse_lap_tracking(
             for cost, d, b, tgt in sorted(candidates, key=lambda c: c[0]):
                 if out_degree[b["ID"]] == 0 and in_degree[tgt["ID"]] < 2:
                     _event_edge(b, tgt, d, cost, "MERGE_FUSION")
+
+    # 4b. Event persistence filter (see filter_transient_events): segmentation flicker in crowded
+    # regions otherwise books a fission at t and a fusion at t+1 for the same two objects.
+    if min_persist > 1:
+        edges, n_dropped = filter_transient_events(edges, spot_lut, min_persist)
+        if n_dropped:
+            print(f"[{movie_id}] Event persistence filter: removed {n_dropped} transient/flicker split-merge edge(s) "
+                  f"(min_event_persistence_frames={min_persist}).")
+            out_degree = defaultdict(int)
+            in_degree = defaultdict(int)
+            for e in edges:
+                out_degree[e["SPOT_SOURCE_ID"]] += 1
+                in_degree[e["SPOT_TARGET_ID"]] += 1
 
     # 5. Connected-Component Lineage Graph Construction (Unifying Split & Merged Branches)
     adj: Dict[int, Set[int]] = defaultdict(set)

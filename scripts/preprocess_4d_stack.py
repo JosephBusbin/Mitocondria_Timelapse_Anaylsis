@@ -280,37 +280,77 @@ def match_histogram_fast_16bit(image: np.ndarray, reference: np.ndarray) -> np.n
     cdf_ref = np.cumsum(hist_ref).astype(np.float64)
     cdf_ref /= max(1.0, cdf_ref[-1])
 
-    # Build 65536-entry lookup table mapping input intensity -> reference intensity
-    lut = np.interp(cdf_img, cdf_ref, np.arange(65536, dtype=np.float32))
+    # Build 65536-entry lookup table mapping input intensity -> reference intensity.
+    # Interpolate only over intensities PRESENT in the reference: the full CDF is flat (=1.0) from
+    # the reference maximum up to 65535, and np.interp on that plateau returns 65535, which used to
+    # saturate each image's brightest voxels (and whole near-empty Z-slices, see synthetic seeds 2/3).
+    present = np.flatnonzero(hist_ref)
+    if present.size == 0:
+        return np.zeros_like(img_u16, dtype=np.float32)
+    lut = np.interp(cdf_img, cdf_ref[present], present.astype(np.float32))
     lut[0] = 0.0  # Keep zero-masked background strictly at 0
     return lut[img_u16]
 
 
-def compensate_z_attenuation_inplace(vol_4d: np.ndarray, trigger_drop_ratio: float = 0.30) -> bool:
+def compensate_z_attenuation_inplace(
+    vol_4d: np.ndarray,
+    trigger_drop_ratio: float = 0.30,
+    cell_4d: np.ndarray = None,
+    cell_mask: np.ndarray = None,
+    max_gain: float = 3.0,
+) -> Dict[str, Any]:
     """
-    Checks if deep Z-slices suffer >30% intensity drop due to brain tissue scattering.
-    If triggered, normalizes each Z-slice's foreground histogram to the brightest quarter of Z-slices.
+    Depth (Z) attenuation correction driven by the CYTOSOLIC cell channel, applied as a smooth gain.
+
+    Why not histogram-match each slice to a bright one (the previous method): with sparse organelles a
+    deep slice can be dim simply because it contains no mitochondria. Matching it to a bright slice
+    stretched its noise to mitochondria-level brightness (practice Series #39: ~1,200 noise objects
+    per frame). The cytosolic fill (channel 2) fills the cell at every depth, so its in-cell signal
+    above background measures attenuation independently of where mitochondria are.
+
+    Method: per Z-slice with enough cell (>= 0.2% of the slice), signal = median(cell channel inside the
+    mask, time-averaged) - median(outside the mask). Fit log(signal) = a + b*z over valid slices. If
+    the fitted drop across the cell's Z-range exceeds trigger_drop_ratio, multiply every mito slice by
+    gain(z) = exp(-b*(z - z_ref)) relative to the brightest end, clipped to [1, max_gain].
+    Returns a dict for provenance (applied, fitted_drop, gains range). Without cell_4d/cell_mask
+    nothing is applied (the organelle channel alone cannot distinguish attenuation from content).
     """
-    n_t, n_z, _, _ = vol_4d.shape
+    info: Dict[str, Any] = {"applied": False, "fitted_drop": None, "max_gain_applied": 1.0}
+    if cell_4d is None or cell_mask is None:
+        info["reason"] = "no cell channel/mask supplied"
+        return info
+    n_t, n_z = vol_4d.shape[:2]
     if n_z < 6:
-        return False
-
-    # Measure 99th percentile intensity per Z-slice at t=0
-    z_profile = np.array([np.percentile(vol_4d[0, z], 99.0) for z in range(n_z)], dtype=np.float32)
-    shallow_mean = float(np.mean(z_profile[: max(2, n_z // 4)]))
-    deep_mean = float(np.mean(z_profile[-max(2, n_z // 4) :]))
-
-    if shallow_mean <= 0 or (shallow_mean - deep_mean) / shallow_mean < trigger_drop_ratio:
-        return False
-
-    # Reference slice is the Z-plane with median high-percentile signal in the top third
-    ref_z_idx = int(np.argmax(z_profile[: max(2, n_z // 3)]))
-    for t in range(n_t):
-        ref_slice = vol_4d[t, ref_z_idx].copy()
-        for z in range(n_z):
-            if z != ref_z_idx and np.max(vol_4d[t, z]) > 0:
-                vol_4d[t, z] = match_histogram_fast_16bit(vol_4d[t, z], ref_slice)
-    return True
+        info["reason"] = "fewer than 6 slices"
+        return info
+    cell_avg = cell_4d.mean(axis=0)
+    slice_vox = cell_mask.shape[1] * cell_mask.shape[2]
+    min_vox = max(50, int(0.002 * slice_vox))
+    zs, sig = [], []
+    for z in range(n_z):
+        inside = cell_mask[z]
+        if inside.sum() < min_vox or (~inside).sum() < min_vox:
+            continue
+        s_val = float(np.median(cell_avg[z][inside]) - np.median(cell_avg[z][~inside]))
+        if s_val > 0:
+            zs.append(z)
+            sig.append(s_val)
+    if len(zs) < 6:
+        info["reason"] = "fewer than 6 slices with enough cell"
+        return info
+    zs_a = np.asarray(zs, dtype=np.float64)
+    slope, intercept = np.polyfit(zs_a, np.log(np.asarray(sig)), 1)
+    fit = np.exp(intercept + slope * zs_a)
+    drop = float(1.0 - fit.min() / fit.max())
+    info["fitted_drop"] = round(drop, 3)
+    if drop < trigger_drop_ratio:
+        info["reason"] = f"fitted drop {drop:.2f} < trigger {trigger_drop_ratio}"
+        return info
+    z_ref = zs_a[np.argmax(fit)]
+    gains = np.clip(np.exp(-slope * (np.arange(n_z) - z_ref)), 1.0, max_gain).astype(np.float32)
+    vol_4d *= gains[np.newaxis, :, np.newaxis, np.newaxis]
+    info.update(applied=True, max_gain_applied=round(float(gains.max()), 3))
+    return info
 
 
 def measure_raw_mito_contrast(
@@ -486,10 +526,17 @@ def preprocess_movie(
     # 4. Axial Z-Attenuation & Temporal Bleach Correction (Fast 16-bit LUT Histogram Matching)
     z_cfg = p_cfg.get("z_attenuation_correction", {})
     z_triggered = False
+    z_info = None
     if z_cfg.get("enabled", True):
-        z_triggered = compensate_z_attenuation_inplace(
-            ch_mito_cropped, float(z_cfg.get("trigger_drop_ratio", 0.30))
+        z_info = compensate_z_attenuation_inplace(
+            ch_mito_cropped,
+            float(z_cfg.get("trigger_drop_ratio", 0.30)),
+            cell_4d=ch_cell_cropped,
+            cell_mask=cell_mask_exact,
+            max_gain=float(z_cfg.get("max_gain", 3.0)),
         )
+        z_triggered = bool(z_info["applied"])
+        print(f"[{movie_id}] Z-attenuation (cell-channel fit): {z_info}")
 
     print(f"[{movie_id}] Applying fast 16-bit LUT Histogram Matching bleach correction across T...")
     ref_t0 = ch_mito_cropped[0].copy()
@@ -560,6 +607,7 @@ def preprocess_movie(
             ],
             "max_cumulative_drift_um": round(max_drift_um, 3),
             "z_attenuation_compensated": z_triggered,
+            "z_attenuation_fitted_drop": (z_info or {}).get("fitted_drop") if z_cfg.get("enabled", True) else None,
             "pre_norm_p1_0": round(float(p_low), 1),
             "pre_norm_p99_9": round(float(p_high), 1),
             "estimated_snr": snr,
